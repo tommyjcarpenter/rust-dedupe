@@ -47,6 +47,13 @@ perceptual_dedupe = { version = "0.1", features = ["ffmpeg", "image"] }
 
 ## Usage
 
+For a complete, runnable end-to-end demo — hashing, matching trims/re-encodes,
+clustering, and the image path — see [`examples/workflow.rs`](examples/workflow.rs):
+
+```sh
+cargo run --example workflow
+```
+
 ### Compare two video clips
 
 ```rust
