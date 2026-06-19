@@ -41,6 +41,9 @@ pub fn hamming32(a: u32, b: u32) -> u32 {
 /// [`Alignment::NO_MATCH`] when none qualifies. Unlike the visual path there is
 /// no motion gate; every overlapping sub-fingerprint is scored.
 pub fn best_audio_alignment(a: &[u32], b: &[u32], min_overlap: usize) -> Alignment {
+    // At least one overlapping sub-fingerprint; treat 0 as 1 so the average is
+    // never computed over an empty (0/0 -> NaN) overlap.
+    let min_overlap = min_overlap.max(1);
     if a.is_empty() || b.is_empty() {
         return Alignment::NO_MATCH;
     }
@@ -203,5 +206,15 @@ mod tests {
         let al = best_audio_alignment(&a, &b, 50);
         assert_eq!(al.overlap, 50);
         assert_eq!(al.avg_bits, 1.0);
+    }
+
+    #[test]
+    fn zero_min_overlap_is_coerced_and_finite() {
+        // min_overlap = 0 must not produce a 0/0 NaN; it is treated as 1.
+        let seq: Vec<u32> = (0..40).collect();
+        let al = best_audio_alignment(&seq, &seq, 0);
+        assert!(al.avg_bits.is_finite());
+        assert_eq!(al.avg_bits, 0.0);
+        assert!(al.overlap >= 1);
     }
 }

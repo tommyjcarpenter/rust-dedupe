@@ -110,10 +110,14 @@ pub enum OverlapKind {
 /* Build a per-frame "moving" mask: frame k is moving if it differs from EITHER
 neighbor by at least `motion_bits`. Using "either neighbor" keeps the boundary
 frame of a moving run counted (no off-by-one that would drop a minimum-length
-clip below the floor), while the interior of a frozen run counts zero. With
-`motion_bits == 0` every frame that has a neighbor is moving, so the gate is a
-no-op and scoring falls back to a plain average. */
+clip below the floor), while the interior of a frozen run counts zero.
+
+`motion_bits == 0` disables the gate entirely: every frame is scored, including
+a single-frame sequence (which has no neighbor to compare against). */
 fn moving_mask(seq: &[u64], motion_bits: u32) -> Vec<bool> {
+    if motion_bits == 0 {
+        return vec![true; seq.len()];
+    }
     (0..seq.len())
         .map(|k| {
             let prev = k > 0 && (seq[k] ^ seq[k - 1]).count_ones() >= motion_bits;
@@ -137,6 +141,9 @@ fn moving_mask(seq: &[u64], motion_bits: u32) -> Vec<bool> {
 /// guaranteed to mirror, though — when several shifts tie on the minimum
 /// average, the first-wins tie-break can pick different ones in each direction.
 pub fn best_alignment(a: &[u64], b: &[u64], min_overlap: usize, motion_bits: u32) -> Alignment {
+    // An alignment needs at least one overlapping frame; treat 0 as 1 so the
+    // average is never computed over an empty (0/0 -> NaN) overlap.
+    let min_overlap = min_overlap.max(1);
     if a.is_empty() || b.is_empty() {
         return Alignment::NO_MATCH;
     }
@@ -452,5 +459,24 @@ mod tests {
             "the static run is excluded from scoring"
         );
         assert_eq!(al.classify(clip.len(), clip.len()), OverlapKind::Identical);
+    }
+
+    #[test]
+    fn motion_gate_off_scores_single_frame() {
+        // With the gate disabled, even a one-frame sequence is scored.
+        let al = best_alignment(&[5u64], &[5u64], 1, 0);
+        assert!(al.matched());
+        assert_eq!(al.avg_bits, 0.0);
+        assert_eq!(al.overlap, 1);
+    }
+
+    #[test]
+    fn zero_min_overlap_is_coerced_and_finite() {
+        // min_overlap = 0 must not produce a 0/0 NaN; it is treated as 1.
+        let seq = moving_seq(40);
+        let al = best_alignment(&seq, &seq, 0, 2);
+        assert!(al.avg_bits.is_finite());
+        assert_eq!(al.avg_bits, 0.0);
+        assert!(al.overlap >= 1);
     }
 }

@@ -228,13 +228,33 @@ impl HammingIndex {
 /// two members (an item with no near-duplicate is not returned). Choosing
 /// which member of a group to keep is the caller's policy, applied to the
 /// returned indices.
+///
+/// The pigeonhole index is zero-false-negative only while `threshold` stays
+/// below [`NUM_CHUNKS`] (two hashes within that many bits must share a chunk).
+/// For a larger `threshold` the differing bits can spread across every chunk,
+/// so this falls back to an exact all-pairs scan to avoid missing pairs.
 pub fn find_duplicates(hashes: &[ImageHash], threshold: u32) -> Vec<Vec<usize>> {
-    let index = HammingIndex::build(hashes);
     let mut edges: Vec<(usize, usize)> = Vec::new();
-    for (i, h) in hashes.iter().enumerate() {
-        for j in index.query(h, Some(i)) {
-            if j > i && h.hamming(&hashes[j]) <= threshold {
-                edges.push((i, j));
+    if (threshold as usize) < NUM_CHUNKS {
+        let index = HammingIndex::build(hashes);
+        for (i, h) in hashes.iter().enumerate() {
+            // Sort the candidate indices so the edge order — and thus the
+            // grouping order from `cluster_edges` — is deterministic rather
+            // than dependent on `HashSet` iteration order.
+            let mut candidates: Vec<usize> = index.query(h, Some(i)).into_iter().collect();
+            candidates.sort_unstable();
+            for j in candidates {
+                if j > i && h.hamming(&hashes[j]) <= threshold {
+                    edges.push((i, j));
+                }
+            }
+        }
+    } else {
+        for i in 0..hashes.len() {
+            for j in (i + 1)..hashes.len() {
+                if hashes[i].hamming(&hashes[j]) <= threshold {
+                    edges.push((i, j));
+                }
             }
         }
     }
@@ -282,6 +302,22 @@ mod tests {
             ImageHash::from_gray_rows(&[0u8; GRAY_LEN - 1]),
             Err(ImageHashError::WrongLength { .. })
         ));
+    }
+
+    #[test]
+    fn threshold_at_or_above_chunks_uses_exact_scan() {
+        // Two hashes that differ by one bit in every chunk: distance NUM_CHUNKS,
+        // yet no single chunk is identical, so the pigeonhole index alone would
+        // miss them. The exact-scan fallback must still group them.
+        let zero = ImageHash::from_hex(&"0".repeat(HASH_BYTES * 2)).unwrap();
+        let spread = ImageHash::from_hex(&"8000".repeat(NUM_CHUNKS)).unwrap();
+        assert_eq!(zero.hamming(&spread), NUM_CHUNKS as u32);
+        // NUM_CHUNKS bits is beyond threshold 15, so not a duplicate there.
+        assert!(find_duplicates(&[zero, spread], (NUM_CHUNKS - 1) as u32).is_empty());
+        // At/above the chunk count, the fallback finds the pair the index can't.
+        let groups = find_duplicates(&[zero, spread], NUM_CHUNKS as u32);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
     }
 
     #[cfg(feature = "image")]
