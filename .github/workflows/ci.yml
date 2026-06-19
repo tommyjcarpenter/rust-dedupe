@@ -7,6 +7,7 @@ on:
       - '.github/workflows/ci.yml'
       - 'src/**'
       - 'tests/**'
+      - 'examples/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
   pull_request:
@@ -15,6 +16,7 @@ on:
       - '.github/workflows/ci.yml'
       - 'src/**'
       - 'tests/**'
+      - 'examples/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
 
