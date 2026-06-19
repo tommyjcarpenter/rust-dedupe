@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ci.yml'
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ci.yml'
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy (all features, deny warnings)
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each entry is the feature selection passed to cargo. The default
+        # build is dependency-free; the rest exercise one optional feature
+        # each, plus the everything-on build.
+        features:
+          - ''
+          - '--features serde'
+          - '--features file-hash'
+          - '--features image'
+          - '--features ffmpeg'
+          - '--all-features'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: Test ${{ matrix.features || '(default features)' }}
+        # ffmpeg/image extraction tests self-skip when the binary/decoder is
+        # absent, so the suite passes regardless of what the runner ships.
+        run: cargo test ${{ matrix.features }} --verbose

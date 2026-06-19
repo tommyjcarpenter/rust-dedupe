@@ -1,0 +1,36 @@
+[package]
+name = "perceptual_dedupe"
+version = "0.1.0"
+edition = "2024"
+description = "Perceptual near-duplicate detection: frame/image difference hashes, sliding-window alignment, audio sub-fingerprint matching, and union-find clustering."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tommyjcarpenter/rust-dedupe"
+readme = "README.md"
+keywords = ["perceptual-hash", "dhash", "deduplication", "hamming", "fingerprint"]
+categories = ["algorithms", "multimedia"]
+
+[features]
+# Default build is pure math with zero dependencies, so the crate stays
+# trivially importable.
+default = []
+# Derive serde on the public result/config types for callers that persist them.
+serde = ["dep:serde"]
+# A small sha2 exact-file digest helper.
+file-hash = ["dep:sha2"]
+# Frame + audio-fingerprint extraction by shelling out to ffmpeg / fpcalc.
+# Adds nothing but std::process at the call site.
+ffmpeg = []
+# Decode an image file/bytes to grayscale pixels for the 256-bit image path.
+image = ["dep:image"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = { version = "0.11", optional = true }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+], optional = true }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
