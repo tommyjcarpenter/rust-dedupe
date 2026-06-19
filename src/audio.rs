@@ -44,6 +44,12 @@ pub fn best_audio_alignment(a: &[u32], b: &[u32], min_overlap: usize) -> Alignme
     if a.is_empty() || b.is_empty() {
         return Alignment::NO_MATCH;
     }
+    // See `align::best_alignment`: guard the i32 shift casts against
+    // pathologically long inputs rather than truncating into bogus bounds.
+    if a.len() > i32::MAX as usize || b.len() > i32::MAX as usize || min_overlap > i32::MAX as usize
+    {
+        return Alignment::NO_MATCH;
+    }
     let max_pos: i32 = a.len() as i32 - min_overlap as i32;
     let max_neg: i32 = min_overlap as i32 - b.len() as i32;
     if max_pos < max_neg {

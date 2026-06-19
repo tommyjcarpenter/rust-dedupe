@@ -59,14 +59,26 @@ impl Alignment {
 
     /// Classify how the two sequences overlap at this alignment, given their
     /// lengths. Lets a caller distinguish a strict superset/subset (one clip
-    /// wholly contains the other) from a partial overlap. See
-    /// [`OverlapKind`].
+    /// wholly contains the other) from a partial overlap. See [`OverlapKind`].
+    ///
+    /// Containment is judged by the geometric window the winning `shift`
+    /// implies, not by [`Alignment::overlap`] — which counts only the frames
+    /// the motion gate actually scored and is therefore smaller than the
+    /// window whenever a static run was excluded.
     pub fn classify(&self, len_a: usize, len_b: usize) -> OverlapKind {
         if self.overlap == 0 {
             return OverlapKind::None;
         }
-        let a_covered = self.overlap == len_a;
-        let b_covered = self.overlap == len_b;
+        let (a_start, b_start) = if self.shift >= 0 {
+            (self.shift as usize, 0)
+        } else {
+            (0, (-self.shift) as usize)
+        };
+        let window = len_a
+            .saturating_sub(a_start)
+            .min(len_b.saturating_sub(b_start));
+        let a_covered = window == len_a;
+        let b_covered = window == len_b;
         match (a_covered, b_covered) {
             (true, true) => OverlapKind::Identical,
             (false, true) => OverlapKind::Contains,
@@ -119,11 +131,21 @@ fn moving_mask(seq: &[u64], motion_bits: u32) -> Vec<bool> {
 /// least `min_overlap` are considered. If none qualifies, returns
 /// [`Alignment::NO_MATCH`].
 ///
-/// The score is symmetric: `best_alignment(a, b, ..)` and
-/// `best_alignment(b, a, ..)` yield the same `avg_bits` and `overlap` (with
-/// negated `shift`), because the moving mask combines both sides.
+/// The minimum `avg_bits` is order-independent: `best_alignment(a, b, ..)` and
+/// `best_alignment(b, a, ..)` return the same `avg_bits`, because the moving
+/// mask and the XOR both commute. The reported `shift` and `overlap` are not
+/// guaranteed to mirror, though — when several shifts tie on the minimum
+/// average, the first-wins tie-break can pick different ones in each direction.
 pub fn best_alignment(a: &[u64], b: &[u64], min_overlap: usize, motion_bits: u32) -> Alignment {
     if a.is_empty() || b.is_empty() {
+        return Alignment::NO_MATCH;
+    }
+    // The shift arithmetic below casts lengths to i32; sequences or an overlap
+    // floor beyond i32::MAX would truncate into bogus bounds (and bad slice
+    // indices). Such inputs are pathological (billions of frames), so treat
+    // them as no match rather than misbehaving.
+    if a.len() > i32::MAX as usize || b.len() > i32::MAX as usize || min_overlap > i32::MAX as usize
+    {
         return Alignment::NO_MATCH;
     }
     /* Valid shift range, derived from the overlap constraint:
@@ -413,5 +435,22 @@ mod tests {
         assert_eq!(al2.classify(b.len(), a.len()), OverlapKind::ContainedBy);
         let same = best_alignment(&a, &a, 8, 2);
         assert_eq!(same.classify(a.len(), a.len()), OverlapKind::Identical);
+    }
+
+    #[test]
+    fn classify_uses_geometric_window_not_scored_frames() {
+        // Two identical clips that include a long static run. The motion gate
+        // scores fewer frames than the full length, but the clips are still
+        // Identical — classification must use the geometric window, not the
+        // (smaller) scored-frame count.
+        let moving = moving_seq(40);
+        let card = vec![0xABCDu64; 40];
+        let clip: Vec<u64> = moving.iter().chain(card.iter()).copied().collect();
+        let al = best_alignment(&clip, &clip, 30, 2);
+        assert!(
+            al.overlap < clip.len(),
+            "the static run is excluded from scoring"
+        );
+        assert_eq!(al.classify(clip.len(), clip.len()), OverlapKind::Identical);
     }
 }
