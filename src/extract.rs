@@ -61,17 +61,21 @@ fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
 
-/* Drain a child's piped stderr into a trimmed string. Only called after the
-child has exited, when its stderr is fully buffered and the read can't block.
-Under the `-v error` flag the volume is tiny, so it never fills the pipe during
-the run either. */
-fn read_stderr(child: &mut std::process::Child) -> String {
-    let Some(mut stderr) = child.stderr.take() else {
-        return String::new();
-    };
-    let mut buf = String::new();
-    let _ = stderr.read_to_string(&mut buf);
-    buf.trim().to_string()
+/* Drain a child's piped stderr on a background thread, returning a handle whose
+join yields the trimmed text. Draining concurrently (rather than after the child
+exits) means stderr can never fill its pipe buffer and block the child mid-run —
+the classic two-pipe deadlock when the parent reads only stdout. The caller
+joins after the child has exited. */
+fn spawn_stderr_reader(
+    stderr: Option<std::process::ChildStderr>,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_string(&mut buf);
+        }
+        buf.trim().to_string()
+    })
 }
 
 /* Build a `NonZeroExit` that includes the tool's stderr when there is any, so a
@@ -135,6 +139,7 @@ impl Extractor {
             .map_err(ExtractError::Spawn)?;
 
         let mut stdout = child.stdout.take().expect("stdout was piped");
+        let stderr_reader = spawn_stderr_reader(child.stderr.take());
         // The output size is predictable from the fixed sampling geometry
         // (fps * window seconds frames, each SAMPLE_BYTES), so pre-allocate to
         // avoid repeated reallocation while streaming.
@@ -160,8 +165,9 @@ impl Extractor {
             }
         }
         let status = child.wait().map_err(ExtractError::Io)?;
+        let stderr = stderr_reader.join().unwrap_or_default();
         if !status.success() {
-            return Err(exit_error("ffmpeg", status, read_stderr(&mut child)));
+            return Err(exit_error("ffmpeg", status, stderr));
         }
         if !data.len().is_multiple_of(SAMPLE_BYTES) {
             return Err(ExtractError::Truncated);
@@ -201,6 +207,10 @@ impl Extractor {
             .map_err(ExtractError::Spawn)?;
 
         let ffmpeg_out = ffmpeg.stdout.take().expect("stdout was piped");
+        // Drain ffmpeg's stderr concurrently: we never read it on this thread
+        // (we read fpcalc's stdout instead), so without a reader a flood of
+        // ffmpeg errors could fill the pipe and block ffmpeg mid-decode.
+        let ffmpeg_stderr_reader = spawn_stderr_reader(ffmpeg.stderr.take());
         let mut fpcalc = Command::new(&self.fpcalc_bin)
             .args(["-raw", "-length", "0", "-"])
             .stdin(Stdio::from(ffmpeg_out))
@@ -214,6 +224,7 @@ impl Extractor {
             })?;
 
         let fpcalc_out = fpcalc.stdout.take().expect("stdout was piped");
+        let fpcalc_stderr_reader = spawn_stderr_reader(fpcalc.stderr.take());
         let mut fingerprint_line: Option<String> = None;
         for line in BufReader::new(fpcalc_out).lines() {
             if is_cancelled(cancel) {
@@ -230,19 +241,13 @@ impl Extractor {
         }
         let fpcalc_status = fpcalc.wait().map_err(ExtractError::Io)?;
         let ffmpeg_status = ffmpeg.wait().map_err(ExtractError::Io)?;
+        let ffmpeg_stderr = ffmpeg_stderr_reader.join().unwrap_or_default();
+        let fpcalc_stderr = fpcalc_stderr_reader.join().unwrap_or_default();
         if !ffmpeg_status.success() {
-            return Err(exit_error(
-                "ffmpeg",
-                ffmpeg_status,
-                read_stderr(&mut ffmpeg),
-            ));
+            return Err(exit_error("ffmpeg", ffmpeg_status, ffmpeg_stderr));
         }
         if !fpcalc_status.success() {
-            return Err(exit_error(
-                "fpcalc",
-                fpcalc_status,
-                read_stderr(&mut fpcalc),
-            ));
+            return Err(exit_error("fpcalc", fpcalc_status, fpcalc_stderr));
         }
 
         let Some(line) = fingerprint_line else {

@@ -31,7 +31,13 @@ fn synth_clip(seed: u64, frames: usize) -> Vec<u64> {
 /// Simulate a re-encode: every frame picks up the same few bits of noise, so
 /// the average distance from the original is `bits_per_frame`.
 fn reencode(clip: &[u64], bits_per_frame: u32) -> Vec<u64> {
-    let mask = (1u64 << bits_per_frame) - 1;
+    // Low `bits_per_frame` bits set, total for any value (a >= 64 shift would
+    // otherwise panic).
+    let mask = if bits_per_frame >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits_per_frame) - 1
+    };
     clip.iter().map(|&h| h ^ mask).collect()
 }
 
