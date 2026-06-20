@@ -17,8 +17,8 @@
 /// Matching and clustering tunables. Construct with [`DedupParams::default`]
 /// and override individual fields, or build one explicitly.
 ///
-/// The visual fields drive [`crate::align`]; the audio fields drive
-/// [`crate::audio`].
+/// Most visual fields are consumed by [`crate::align`] and most audio fields by
+/// [`crate::audio`]; `sample_window_secs` is a caller-side extraction parameter.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DedupParams {
