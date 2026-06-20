@@ -273,3 +273,29 @@ fn classify_reports_containment() {
     let al = best_alignment(&a, &b, 8, 2);
     assert_eq!(al.classify(a.len(), b.len()), OverlapKind::Contains);
 }
+
+#[test]
+fn find_candidates_edge_order_is_deterministic() {
+    // Three mutually-matching clips. Inserting them into the map in different
+    // orders must still yield the same edge sequence — the finder sorts by id,
+    // so the result no longer depends on HashMap iteration order.
+    let params = DedupParams::default();
+    let seq = moving_seq(40);
+    let ranks = rank(&[(1, 0), (2, 1), (3, 2)]);
+
+    let build = |order: [u64; 3]| {
+        let mut hashes: HashMap<u64, Vec<u64>> = HashMap::new();
+        for id in order {
+            hashes.insert(id, seq.clone());
+        }
+        find_candidates(&hashes, &ranks, &HashSet::new(), &params)
+            .iter()
+            .map(|e| (e.canonical, e.member))
+            .collect::<Vec<_>>()
+    };
+
+    let baseline = build([1, 2, 3]);
+    assert_eq!(baseline.len(), 3);
+    assert_eq!(build([3, 2, 1]), baseline);
+    assert_eq!(build([2, 3, 1]), baseline);
+}

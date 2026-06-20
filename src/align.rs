@@ -353,7 +353,10 @@ where
     Id: Copy + Eq + Hash + Ord,
     V: AsRef<[u64]>,
 {
-    let entries: Vec<(Id, &[u64])> = hashes.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+    // Sort by id so the edge order (and any downstream clustering order) is
+    // reproducible rather than dependent on HashMap iteration order.
+    let mut entries: Vec<(Id, &[u64])> = hashes.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+    entries.sort_unstable_by_key(|(id, _)| *id);
     let mut out = Vec::new();
     for i in 0..entries.len() {
         for j in (i + 1)..entries.len() {
