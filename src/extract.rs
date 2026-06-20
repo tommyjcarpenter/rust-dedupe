@@ -61,6 +61,29 @@ fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
 
+/* Drain a child's piped stderr into a trimmed string. Only called after the
+child has exited, when its stderr is fully buffered and the read can't block.
+Under the `-v error` flag the volume is tiny, so it never fills the pipe during
+the run either. */
+fn read_stderr(child: &mut std::process::Child) -> String {
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut buf = String::new();
+    let _ = stderr.read_to_string(&mut buf);
+    buf.trim().to_string()
+}
+
+/* Build a `NonZeroExit` that includes the tool's stderr when there is any, so a
+production failure (missing codec, bad input, permissions) is diagnosable. */
+fn exit_error(tool: &str, status: std::process::ExitStatus, stderr: String) -> ExtractError {
+    if stderr.is_empty() {
+        ExtractError::NonZeroExit(format!("{tool} exit {status}"))
+    } else {
+        ExtractError::NonZeroExit(format!("{tool} exit {status}: {stderr}"))
+    }
+}
+
 /// Runs `ffmpeg` / `fpcalc`, capturing the binary names once so per-call
 /// signatures stay short. Construct with [`Extractor::default`] (uses
 /// `ffmpeg` and `fpcalc` from PATH) or set the paths explicitly.
@@ -107,12 +130,18 @@ impl Extractor {
             .args(["-vf", &vf])
             .args(["-an", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(ExtractError::Spawn)?;
 
         let mut stdout = child.stdout.take().expect("stdout was piped");
-        let mut data: Vec<u8> = Vec::new();
+        // The output size is predictable from the fixed sampling geometry
+        // (fps * window seconds frames, each SAMPLE_BYTES), so pre-allocate to
+        // avoid repeated reallocation while streaming.
+        let expected = (SAMPLE_FPS as usize)
+            .saturating_mul(window_secs as usize)
+            .saturating_mul(SAMPLE_BYTES);
+        let mut data: Vec<u8> = Vec::with_capacity(expected);
         let mut buf = [0u8; READ_BUF];
         loop {
             if is_cancelled(cancel) {
@@ -132,7 +161,7 @@ impl Extractor {
         }
         let status = child.wait().map_err(ExtractError::Io)?;
         if !status.success() {
-            return Err(ExtractError::NonZeroExit(format!("ffmpeg exit {status}")));
+            return Err(exit_error("ffmpeg", status, read_stderr(&mut child)));
         }
         if !data.len().is_multiple_of(SAMPLE_BYTES) {
             return Err(ExtractError::Truncated);
@@ -167,7 +196,7 @@ impl Extractor {
             ])
             .args(["-f", "wav", "pipe:1"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(ExtractError::Spawn)?;
 
@@ -176,7 +205,7 @@ impl Extractor {
             .args(["-raw", "-length", "0", "-"])
             .stdin(Stdio::from(ffmpeg_out))
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
                 let _ = ffmpeg.kill();
@@ -202,14 +231,18 @@ impl Extractor {
         let fpcalc_status = fpcalc.wait().map_err(ExtractError::Io)?;
         let ffmpeg_status = ffmpeg.wait().map_err(ExtractError::Io)?;
         if !ffmpeg_status.success() {
-            return Err(ExtractError::NonZeroExit(format!(
-                "ffmpeg exit {ffmpeg_status}"
-            )));
+            return Err(exit_error(
+                "ffmpeg",
+                ffmpeg_status,
+                read_stderr(&mut ffmpeg),
+            ));
         }
         if !fpcalc_status.success() {
-            return Err(ExtractError::NonZeroExit(format!(
-                "fpcalc exit {fpcalc_status}"
-            )));
+            return Err(exit_error(
+                "fpcalc",
+                fpcalc_status,
+                read_stderr(&mut fpcalc),
+            ));
         }
 
         let Some(line) = fingerprint_line else {

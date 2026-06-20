@@ -57,7 +57,8 @@ pub enum ImageHashError {
     },
     /// A hex string contained a non-hex character.
     BadHex,
-    /// The image crate failed to decode or process the input.
+    /// Loading the image failed: reading the file, or decoding/processing the
+    /// bytes.
     #[cfg(feature = "image")]
     Decode(String),
 }
@@ -70,7 +71,7 @@ impl fmt::Display for ImageHashError {
             }
             ImageHashError::BadHex => write!(f, "invalid hex digit"),
             #[cfg(feature = "image")]
-            ImageHashError::Decode(msg) => write!(f, "image decode failed: {msg}"),
+            ImageHashError::Decode(msg) => write!(f, "image load/decode failed: {msg}"),
         }
     }
 }

@@ -15,9 +15,10 @@
 //! at least `motion_bits`). The "either side" rule keeps the score symmetric,
 //! so a verdict never depends on argument order.
 //!
-//! Setting `motion_bits = 0` disables the gate: every frame with a neighbor
-//! counts, which reproduces the plain average-over-all-overlapping-frames
-//! behavior. The two regimes are otherwise the same code path.
+//! Setting `motion_bits = 0` disables the gate: every frame is scored
+//! (including a lone single-frame sequence), which reproduces the plain
+//! average-over-all-overlapping-frames behavior. The two regimes are otherwise
+//! the same code path.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -28,9 +29,10 @@ use crate::config::DedupParams;
 /// Hamming distance per scored (moving) frame, and how many frames that
 /// average was taken over.
 ///
-/// A positive `shift` means the second sequence starts later in the first
-/// sequence's frame of reference (the first is trimmed at the front); a
-/// negative shift means it starts earlier.
+/// A positive `shift` means the second sequence (`b`) starts later in the first
+/// sequence's (`a`) frame of reference — i.e. `b` is `a` with its front
+/// trimmed. A negative shift means `b` starts earlier — `a` is `b` with its
+/// front trimmed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Alignment {
