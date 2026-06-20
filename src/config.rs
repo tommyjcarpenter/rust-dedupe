@@ -22,9 +22,9 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DedupParams {
-    /// Seconds of content sampled per clip. Governs how many frames a newly
-    /// ingested clip stores; a larger window lets the sliding search find
-    /// matches with larger trim offsets between two clips' in-points.
+    /// Seconds of content sampled per clip. Not consumed by the matching primitives;
+    /// callers use this to decide how many hashes/sub-fingerprints to extract and
+    /// store per item (e.g., the window length they pass to their extractor).
     pub sample_window_secs: u32,
 
     /// Average per-frame Hamming distance at or below which a visual alignment
