@@ -69,12 +69,24 @@ joins after the child has exited. */
 fn spawn_stderr_reader(
     stderr: Option<std::process::ChildStderr>,
 ) -> std::thread::JoinHandle<String> {
+    // Drain stderr completely to avoid blocked pipes, but only retain a bounded
+    // prefix for diagnostics.
+    const MAX_CAPTURE: usize = 128 * 1024;
     std::thread::spawn(move || {
-        let mut buf = String::new();
+        let mut captured = String::new();
         if let Some(mut s) = stderr {
-            let _ = s.read_to_string(&mut buf);
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if captured.len() < MAX_CAPTURE {
+                    let take = (MAX_CAPTURE - captured.len()).min(n);
+                    captured.push_str(&String::from_utf8_lossy(&buf[..take]));
+                }
+            }
         }
-        buf.trim().to_string()
+        captured.trim().to_string()
     })
 }
 
