@@ -181,7 +181,9 @@ pub fn best_alignment(a: &[u64], b: &[u64], min_overlap: usize, motion_bits: u32
             continue;
         }
         let mut moving_overlap = 0usize;
-        let mut total_bits = 0u32;
+        // u64 accumulator: a long overlap can sum more than u32::MAX bits
+        // (overlap up to i32::MAX, times 64 bits per frame).
+        let mut total_bits = 0u64;
         let a_win = &a[a_start..a_start + overlap];
         let b_win = &b[b_start..b_start + overlap];
         let ma = &moving_a[a_start..a_start + overlap];
@@ -189,13 +191,13 @@ pub fn best_alignment(a: &[u64], b: &[u64], min_overlap: usize, motion_bits: u32
         for (((&ah, &bh), &am), &bm) in a_win.iter().zip(b_win).zip(ma).zip(mb) {
             if am || bm {
                 moving_overlap += 1;
-                total_bits += (ah ^ bh).count_ones();
+                total_bits += u64::from((ah ^ bh).count_ones());
             }
         }
         if moving_overlap < min_overlap {
             continue;
         }
-        let avg = total_bits as f32 / moving_overlap as f32;
+        let avg = (total_bits as f64 / moving_overlap as f64) as f32;
         if avg < best.avg_bits {
             best = Alignment {
                 shift,

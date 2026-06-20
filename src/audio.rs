@@ -69,12 +69,14 @@ pub fn best_audio_alignment(a: &[u32], b: &[u32], min_overlap: usize) -> Alignme
         if overlap < min_overlap {
             continue;
         }
-        let total_bits: u32 = a[a_start..a_start + overlap]
+        // u64 accumulator: a long overlap can sum more than u32::MAX bits
+        // (overlap up to i32::MAX, times 32 bits per sub-fingerprint).
+        let total_bits: u64 = a[a_start..a_start + overlap]
             .iter()
             .zip(&b[b_start..b_start + overlap])
-            .map(|(&x, &y)| (x ^ y).count_ones())
+            .map(|(&x, &y)| u64::from((x ^ y).count_ones()))
             .sum();
-        let avg = total_bits as f32 / overlap as f32;
+        let avg = (total_bits as f64 / overlap as f64) as f32;
         if avg < best.avg_bits {
             best = Alignment {
                 shift,
