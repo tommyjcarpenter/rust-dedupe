@@ -93,6 +93,35 @@ for group in cluster_edges(&pairs) {
 }
 ```
 
+### Match one clip against a large corpus
+
+`find_candidates` answers "which pairs in this set are dupes" in one all-pairs
+pass. When you instead have a big, persistent corpus and want "which corpus
+items could match THIS incoming clip", build a [`FrameCorpusIndex`] once and
+query it per clip — a pigeonhole band prefilter that returns a small candidate
+set to verify, instead of rescanning the whole corpus.
+
+```rust
+use perceptual_dedupe::{FrameCorpusIndex, DedupParams, score_visual_segments};
+
+// Build the index once over the corpus (each item's frame hashes).
+let mut index = FrameCorpusIndex::new();
+index.add("archived_clip_1", vec![/* frame hashes */]);
+index.add("archived_clip_2", vec![/* frame hashes */]);
+
+// Per incoming clip: get candidates, then confirm each with a full score.
+let incoming: Vec<u64> = /* ... */ Vec::new();
+let params = DedupParams::default();
+for id in index.query(incoming.iter().copied()) {
+    // score_visual_segments(&[incoming.clone()], &corpus_segments_for(id), &params)
+    //     .filter(|s| s.avg_bits <= params.threshold_bits) => a real match
+    let _ = id;
+}
+```
+
+The index errs toward recall (extra candidates); the score pass is what actually
+accepts or rejects. Append-only — rebuild to forget an item.
+
 ### Dedup images
 
 ```rust
