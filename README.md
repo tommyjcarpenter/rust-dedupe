@@ -106,11 +106,11 @@ use perceptual_dedupe::{FrameCorpusIndex, DedupParams, score_visual_segments};
 
 // Build the index once over the corpus (each item's frame hashes).
 let mut index = FrameCorpusIndex::new();
-index.add("archived_clip_1", vec![/* frame hashes */]);
-index.add("archived_clip_2", vec![/* frame hashes */]);
+index.add("archived_clip_1", [0x1122_3344_5566_7788_u64, 0x99AA_BBCC_DDEE_FF00]);
+index.add("archived_clip_2", [0x0000_0000_0000_0001_u64]);
 
 // Per incoming clip: get candidates, then confirm each with a full score.
-let incoming: Vec<u64> = /* ... */ Vec::new();
+let incoming: Vec<u64> = vec![0x1122_3344_5566_7788];
 let params = DedupParams::default();
 for id in index.query(incoming.iter().copied()) {
     // score_visual_segments(&[incoming.clone()], &corpus_segments_for(id), &params)

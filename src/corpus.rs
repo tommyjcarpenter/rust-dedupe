@@ -113,8 +113,11 @@ impl<Id> FrameCorpusIndex<Id> {
 }
 
 impl<Id: Copy + Eq + Hash> FrameCorpusIndex<Id> {
-    /// Index `frames` under `id`. An id lands at most once per (band, value)
-    /// bucket, so an item with many similar frames doesn't bloat the buckets.
+    /// Index `frames` under `id`. Within this call `id` lands at most once per
+    /// (band, value) bucket, so an item with many similar frames doesn't bloat
+    /// the buckets. Adding the same `id` across multiple calls is NOT deduplicated
+    /// (it can then appear more than once in a bucket, though [`query`](Self::query)
+    /// still returns it once) — rebuild the index to replace an item.
     pub fn add(&mut self, id: Id, frames: impl IntoIterator<Item = u64>) {
         let mut seen: HashSet<(usize, u16)> = HashSet::new();
         for f in frames {
