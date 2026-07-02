@@ -55,6 +55,7 @@ pub mod align;
 pub mod audio;
 pub mod cluster;
 pub mod config;
+pub mod corpus;
 pub mod frame_hash;
 pub mod image_hash;
 
@@ -74,5 +75,6 @@ pub use audio::{
 };
 pub use cluster::cluster_edges;
 pub use config::DedupParams;
+pub use corpus::FrameCorpusIndex;
 pub use frame_hash::{SAMPLE_BYTES, SAMPLE_FPS, SAMPLE_H, SAMPLE_W, dhash_9x8, hamming64};
 pub use image_hash::{HammingIndex, ImageHash, ImageHashError, find_duplicates};
