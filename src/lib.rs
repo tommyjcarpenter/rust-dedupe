@@ -79,4 +79,4 @@ pub use config::DedupParams;
 pub use corpus::FrameCorpusIndex;
 pub use frame_hash::{SAMPLE_BYTES, SAMPLE_FPS, SAMPLE_H, SAMPLE_W, dhash_9x8, hamming64};
 pub use image_hash::{HammingIndex, ImageHash, ImageHashError, find_duplicates};
-pub use verdict::{DupeVerdict, classify_pair};
+pub use verdict::{DupeVerdict, classify, classify_pair, needs_audio_corroboration};

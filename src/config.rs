@@ -27,15 +27,19 @@ pub struct DedupParams {
     /// store per item (e.g., the window length they pass to their extractor).
     pub sample_window_secs: u32,
 
-    /// Average per-frame Hamming distance at or below which a visual alignment
-    /// is taken as a duplicate. Roughly: bits-flipped per 64-bit frame hash.
+    /// Average per-frame Hamming distance at or below which a visual alignment is close enough to be considered
+    /// at all. Roughly: bits-flipped per 64-bit frame hash.
+    ///
+    /// Under [`crate::classify`] this is the outer ceiling rather than the admission line: a pair inside it is a
+    /// duplicate only if it is also near-identical, or its audio agrees. Nothing past it is ever a duplicate.
     pub threshold_bits: f32,
 
-    /// Average visual distance at or below which a match is "near-identical"
-    /// and stands on the visual signal alone, without audio corroboration.
+    /// Average visual distance at or below which a match is "near-identical" and stands on the visual signal
+    /// alone, without audio corroboration.
     ///
-    /// Applied by [`crate::classify_pair`]. Consumers that want a different
-    /// policy can read this field and decide for themselves instead.
+    /// Read by [`crate::classify`] and [`crate::needs_audio_corroboration`] only. The matching primitives
+    /// ([`crate::score_visual`], [`crate::find_candidates`]) do not consult it, so a consumer that skips the
+    /// policy layer is unaffected by it.
     pub near_identical_visual_bits: f32,
 
     /// Frame-to-frame hash change at or above which content is considered to
