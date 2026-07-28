@@ -58,6 +58,7 @@ pub mod config;
 pub mod corpus;
 pub mod frame_hash;
 pub mod image_hash;
+pub mod verdict;
 
 #[cfg(feature = "file-hash")]
 pub mod file_hash;
@@ -78,3 +79,4 @@ pub use config::DedupParams;
 pub use corpus::FrameCorpusIndex;
 pub use frame_hash::{SAMPLE_BYTES, SAMPLE_FPS, SAMPLE_H, SAMPLE_W, dhash_9x8, hamming64};
 pub use image_hash::{HammingIndex, ImageHash, ImageHashError, find_duplicates};
+pub use verdict::{DupeVerdict, classify_pair};

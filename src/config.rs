@@ -31,11 +31,11 @@ pub struct DedupParams {
     /// is taken as a duplicate. Roughly: bits-flipped per 64-bit frame hash.
     pub threshold_bits: f32,
 
-    /// Average visual distance at or below which callers may treat a match as
-    /// "near-identical" without requiring audio corroboration.
+    /// Average visual distance at or below which a match is "near-identical"
+    /// and stands on the visual signal alone, without audio corroboration.
     ///
-    /// Note: this crate does not automatically apply this policy; it is a hint
-    /// for consumer-side orchestration.
+    /// Applied by [`crate::classify_pair`]. Consumers that want a different
+    /// policy can read this field and decide for themselves instead.
     pub near_identical_visual_bits: f32,
 
     /// Frame-to-frame hash change at or above which content is considered to
