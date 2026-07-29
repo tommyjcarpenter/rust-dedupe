@@ -128,7 +128,9 @@ accepts or rejects. Append-only — rebuild to forget an item.
 use perceptual_dedupe::{ImageHash, find_duplicates};
 
 // `from_image_path` needs the `image` feature; without it, build hashes from
-// your own grayscale pixels via `ImageHash::from_gray_rows`.
+// your own grayscale pixels via `ImageHash::from_gray_rows`. It converts to
+// grayscale with the BT.601 weights, so hashes stay comparable with those from
+// other toolchains rather than depending on a decoder's default standard.
 let hashes: Vec<ImageHash> = vec![
     ImageHash::from_image_path("a.jpg").unwrap(),
     ImageHash::from_image_path("b.jpg").unwrap(),
