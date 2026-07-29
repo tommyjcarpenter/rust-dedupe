@@ -7,13 +7,26 @@
 //!
 //! # Parity scope
 //!
-//! [`ImageHash::from_gray_rows`] is bit-exact: given the same grayscale pixels
-//! it produces the same bits as the reference implementation, byte for byte,
-//! and [`ImageHash::to_hex`] matches a zero-padded 64-char hex of that value.
-//! Decoding and resizing an actual image file (the `image` feature) is NOT
-//! bit-exact across libraries, because resampling filters differ; parity is
-//! guaranteed only from the grayscale rows inward.
+//! [`ImageHash::from_gray_rows`] is bit-exact: given the same grayscale pixels,
+//! any implementation of the same rule produces the same bits, and
+//! [`ImageHash::to_hex`] is a zero-padded 64-char hex of that value.
+//!
+//! Decoding and resizing an actual image file (the `image` feature) is not
+//! bit-exact across libraries. JPEG decoding is specified as an error tolerance
+//! rather than exact equality, and Lanczos implementations differ in
+//! coefficient precision, so two libraries can disagree by a bit or two out of
+//! 256. Against a noise floor of roughly 127 bits between unrelated images,
+//! that residual does not matter at any usable threshold.
+//!
+//! Grayscale conversion is the exception, and the reason it is pinned here:
+//! implementations disagree about it by definition rather than by rounding,
+//! since BT.601 and BT.709 are different standards with different weights.
+//! Inheriting whichever one the decoding crate happens to default to would put
+//! hashes tens of bits apart for no algorithmic reason, so this module fixes
+//! the weights itself — see [`GRAY_R`].
 
+#[cfg(feature = "image")]
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -37,6 +50,24 @@ pub const HASH_BYTES: usize = HASH_SIZE * HASH_SIZE / 8;
 /// any two hashes within Hamming distance 15 share at least one identical
 /// chunk (pigeonhole), so the index has no false negatives at that threshold.
 pub const NUM_CHUNKS: usize = HASH_SIZE;
+
+/* BT.601 luma weights in 16-bit fixed point. Photographic sources are overwhelmingly BT.601 —
+it is what JPEG encodes natively — and it is what the long-established still-image toolchains
+convert with, so a hash built on it is comparable with the widest range of other producers.
+The three weights sum to exactly 1 << GRAY_SHIFT, which makes an already-grayscale source
+round-trip to itself rather than drifting by a least significant bit. */
+
+/// Fixed-point BT.601 luma weight for the red channel.
+pub const GRAY_R: u32 = 19595;
+
+/// Fixed-point BT.601 luma weight for the green channel.
+pub const GRAY_G: u32 = 38470;
+
+/// Fixed-point BT.601 luma weight for the blue channel.
+pub const GRAY_B: u32 = 7471;
+
+/// Fractional bits in the [`GRAY_R`] / [`GRAY_G`] / [`GRAY_B`] weights.
+pub const GRAY_SHIFT: u32 = 16;
 
 /// A 256-bit image difference hash, stored big-endian (byte 0 is the most
 /// significant), so [`ImageHash::to_hex`] reads like a plain hex number.
@@ -77,6 +108,29 @@ impl fmt::Display for ImageHashError {
 }
 
 impl std::error::Error for ImageHashError {}
+
+/* Convert to grayscale with the BT.601 weights rather than `DynamicImage::to_luma8`, whose
+choice of standard is the decoding crate's to change. Going via RGB keeps one code path for
+every source pixel format, and the weights sum to unity, so a source that is already 8-bit
+grayscale would come back out of that path bit-for-bit identical — borrow it instead and skip
+both the RGB buffer and the arithmetic. */
+#[cfg(feature = "image")]
+fn to_luma_bt601(img: &image::DynamicImage) -> Cow<'_, image::GrayImage> {
+    if let image::DynamicImage::ImageLuma8(gray) = img {
+        return Cow::Borrowed(gray);
+    }
+    let rgb = img.to_rgb8();
+    let mut out = image::GrayImage::new(rgb.width(), rgb.height());
+    for (dst, src) in out.pixels_mut().zip(rgb.pixels()) {
+        let [r, g, b] = src.0;
+        let sum = u32::from(r) * GRAY_R + u32::from(g) * GRAY_G + u32::from(b) * GRAY_B;
+        // Weights summing to 1<<GRAY_SHIFT bound this at 255, so the cast cannot truncate.
+        let luma = (sum + (1 << (GRAY_SHIFT - 1))) >> GRAY_SHIFT;
+        debug_assert!(luma <= u32::from(u8::MAX));
+        dst.0 = [luma as u8];
+    }
+    Cow::Owned(out)
+}
 
 impl ImageHash {
     /// Compute the difference hash from [`GRAY_LEN`] grayscale bytes, row-major
@@ -149,16 +203,16 @@ impl ImageHash {
         u16::from_be_bytes([self.0[i * 2], self.0[i * 2 + 1]])
     }
 
-    /// Decode image bytes (JPEG/PNG), convert to grayscale, resize to the hash
-    /// grid, and hash. NOT bit-identical to other resamplers — see the module
-    /// docs.
+    /// Decode image bytes, convert to BT.601 grayscale, resize to the hash grid,
+    /// and hash. Not bit-identical to other decoders and resamplers — see the
+    /// module docs for how far apart they land.
     #[cfg(feature = "image")]
     pub fn from_image_bytes(data: &[u8]) -> Result<ImageHash, ImageHashError> {
         let img =
             image::load_from_memory(data).map_err(|e| ImageHashError::Decode(e.to_string()))?;
-        let luma = img.to_luma8();
+        let luma = to_luma_bt601(&img);
         let resized = image::imageops::resize(
-            &luma,
+            luma.as_ref(),
             ROW_STRIDE as u32,
             HASH_SIZE as u32,
             image::imageops::FilterType::Lanczos3,
@@ -336,5 +390,60 @@ mod tests {
             .unwrap();
         let h = ImageHash::from_image_bytes(&bytes).unwrap();
         assert_eq!(h.to_hex(), "0".repeat(HASH_BYTES * 2));
+    }
+
+    #[test]
+    fn gray_weights_sum_to_unity() {
+        // What makes an already-grayscale source survive the conversion untouched.
+        assert_eq!(GRAY_R + GRAY_G + GRAY_B, 1 << GRAY_SHIFT);
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn grayscale_conversion_is_bt601_not_bt709() {
+        // Pure primaries are where the two standards diverge most, so they pin which one is
+        // in use: BT.709 would give 54 / 182 / 18 for the same inputs.
+        for (rgb, want) in [([255, 0, 0], 76u8), ([0, 255, 0], 150), ([0, 0, 255], 29)] {
+            let img =
+                image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb(rgb)));
+            assert_eq!(
+                to_luma_bt601(&img).get_pixel(0, 0).0,
+                [want],
+                "rgb {rgb:?} should be BT.601 luma {want}"
+            );
+        }
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn grayscale_source_is_borrowed_not_recomputed() {
+        for v in [0u8, 1, 77, 128, 254, 255] {
+            let img = image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
+                1,
+                1,
+                image::Luma([v]),
+            ));
+            let luma = to_luma_bt601(&img);
+            assert!(matches!(luma, Cow::Borrowed(_)), "gray {v} should borrow");
+            assert_eq!(luma.get_pixel(0, 0).0, [v], "gray {v}");
+        }
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn neutral_colour_survives_the_arithmetic_path() {
+        // The borrow above skips the weights entirely, so exercise them on a source that has
+        // to go through RGB: r == g == b must come back out unchanged, which is the unity
+        // property doing its job rather than just being asserted about.
+        for v in [0u8, 1, 77, 128, 254, 255] {
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([v, v, v]),
+            ));
+            let luma = to_luma_bt601(&img);
+            assert!(matches!(luma, Cow::Owned(_)), "rgb {v} should convert");
+            assert_eq!(luma.get_pixel(0, 0).0, [v], "rgb {v}");
+        }
     }
 }
