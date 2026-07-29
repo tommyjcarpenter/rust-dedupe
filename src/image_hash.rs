@@ -25,6 +25,8 @@
 //! hashes tens of bits apart for no algorithmic reason, so this module fixes
 //! the weights itself — see [`GRAY_R`].
 
+#[cfg(feature = "image")]
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -109,10 +111,14 @@ impl std::error::Error for ImageHashError {}
 
 /* Convert to grayscale with the BT.601 weights rather than `DynamicImage::to_luma8`, whose
 choice of standard is the decoding crate's to change. Going via RGB keeps one code path for
-every source pixel format; an already-grayscale source survives it unchanged, because the
-weights sum to unity. */
+every source pixel format, and the weights sum to unity, so a source that is already 8-bit
+grayscale would come back out of that path bit-for-bit identical — borrow it instead and skip
+both the RGB buffer and the arithmetic. */
 #[cfg(feature = "image")]
-fn to_luma_bt601(img: &image::DynamicImage) -> image::GrayImage {
+fn to_luma_bt601(img: &image::DynamicImage) -> Cow<'_, image::GrayImage> {
+    if let image::DynamicImage::ImageLuma8(gray) = img {
+        return Cow::Borrowed(gray);
+    }
     let rgb = img.to_rgb8();
     let mut out = image::GrayImage::new(rgb.width(), rgb.height());
     for (dst, src) in out.pixels_mut().zip(rgb.pixels()) {
@@ -123,7 +129,7 @@ fn to_luma_bt601(img: &image::DynamicImage) -> image::GrayImage {
         debug_assert!(luma <= u32::from(u8::MAX));
         dst.0 = [luma as u8];
     }
-    out
+    Cow::Owned(out)
 }
 
 impl ImageHash {
@@ -206,7 +212,7 @@ impl ImageHash {
             image::load_from_memory(data).map_err(|e| ImageHashError::Decode(e.to_string()))?;
         let luma = to_luma_bt601(&img);
         let resized = image::imageops::resize(
-            &luma,
+            luma.as_ref(),
             ROW_STRIDE as u32,
             HASH_SIZE as u32,
             image::imageops::FilterType::Lanczos3,
@@ -410,14 +416,34 @@ mod tests {
 
     #[cfg(feature = "image")]
     #[test]
-    fn grayscale_source_round_trips_unchanged() {
+    fn grayscale_source_is_borrowed_not_recomputed() {
         for v in [0u8, 1, 77, 128, 254, 255] {
             let img = image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
                 1,
                 1,
                 image::Luma([v]),
             ));
-            assert_eq!(to_luma_bt601(&img).get_pixel(0, 0).0, [v], "gray {v}");
+            let luma = to_luma_bt601(&img);
+            assert!(matches!(luma, Cow::Borrowed(_)), "gray {v} should borrow");
+            assert_eq!(luma.get_pixel(0, 0).0, [v], "gray {v}");
+        }
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn neutral_colour_survives_the_arithmetic_path() {
+        // The borrow above skips the weights entirely, so exercise them on a source that has
+        // to go through RGB: r == g == b must come back out unchanged, which is the unity
+        // property doing its job rather than just being asserted about.
+        for v in [0u8, 1, 77, 128, 254, 255] {
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([v, v, v]),
+            ));
+            let luma = to_luma_bt601(&img);
+            assert!(matches!(luma, Cow::Owned(_)), "rgb {v} should convert");
+            assert_eq!(luma.get_pixel(0, 0).0, [v], "rgb {v}");
         }
     }
 }
