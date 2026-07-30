@@ -109,24 +109,37 @@ pub enum OverlapKind {
     None,
 }
 
-/* Build a per-frame "moving" mask: frame k is moving if it differs from EITHER
+/* Build a per-element "moving" mask: element k is moving if it differs from EITHER
 neighbor by at least `motion_bits`. Using "either neighbor" keeps the boundary
-frame of a moving run counted (no off-by-one that would drop a minimum-length
+element of a moving run counted (no off-by-one that would drop a minimum-length
 clip below the floor), while the interior of a frozen run counts zero.
 
-`motion_bits == 0` disables the gate entirely: every frame is scored, including
-a single-frame sequence (which has no neighbor to compare against). */
-fn moving_mask(seq: &[u64], motion_bits: u32) -> Vec<bool> {
+`motion_bits == 0` disables the gate entirely: every element is scored, including
+a single-element sequence (which has no neighbor to compare against).
+
+Generic over the element and its distance so the audio path shares this rather
+than growing a near-identical copy — a frozen run means the same thing on either
+signal (a repeated frame, or digital silence fingerprinting to a constant). */
+pub(crate) fn moving_mask<T>(
+    seq: &[T],
+    motion_bits: u32,
+    dist: impl Fn(&T, &T) -> u32,
+) -> Vec<bool> {
     if motion_bits == 0 {
         return vec![true; seq.len()];
     }
     (0..seq.len())
         .map(|k| {
-            let prev = k > 0 && (seq[k] ^ seq[k - 1]).count_ones() >= motion_bits;
-            let next = k + 1 < seq.len() && (seq[k] ^ seq[k + 1]).count_ones() >= motion_bits;
+            let prev = k > 0 && dist(&seq[k], &seq[k - 1]) >= motion_bits;
+            let next = k + 1 < seq.len() && dist(&seq[k], &seq[k + 1]) >= motion_bits;
             prev || next
         })
         .collect()
+}
+
+/// Hamming distance between two 64-bit frame hashes.
+pub(crate) fn hamming64_dist(a: &u64, b: &u64) -> u32 {
+    (a ^ b).count_ones()
 }
 
 /// Find the best alignment of `b` against `a` by sliding `b`'s hash sequence
@@ -167,8 +180,8 @@ pub fn best_alignment(a: &[u64], b: &[u64], min_overlap: usize, motion_bits: u32
     if max_pos < max_neg {
         return Alignment::NO_MATCH;
     }
-    let moving_a = moving_mask(a, motion_bits);
-    let moving_b = moving_mask(b, motion_bits);
+    let moving_a = moving_mask(a, motion_bits, hamming64_dist);
+    let moving_b = moving_mask(b, motion_bits, hamming64_dist);
     let mut best = Alignment::NO_MATCH;
     for shift in max_neg..=max_pos {
         let (a_start, b_start) = if shift >= 0 {

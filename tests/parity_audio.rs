@@ -25,7 +25,7 @@ fn hamming32_basics() {
 #[test]
 fn audio_perfect_match_at_zero_shift() {
     let seq: Vec<u32> = (0..60).collect();
-    let al = best_audio_alignment(&seq, &seq, 50);
+    let al = best_audio_alignment(&seq, &seq, 50, 0);
     assert_eq!((al.shift, al.avg_bits, al.overlap), (0, 0.0, 60));
 }
 
@@ -33,7 +33,7 @@ fn audio_perfect_match_at_zero_shift() {
 fn audio_positive_shift_b_is_tail() {
     let a: Vec<u32> = (0..60).collect();
     let b = a[5..].to_vec();
-    let al = best_audio_alignment(&a, &b, 50);
+    let al = best_audio_alignment(&a, &b, 50, 0);
     assert_eq!((al.shift, al.avg_bits, al.overlap), (5, 0.0, 55));
 }
 
@@ -42,13 +42,13 @@ fn audio_negative_shift_b_has_leading_extra() {
     let a: Vec<u32> = (0..60).collect();
     let mut b = vec![99u32; 5];
     b.extend(a.iter().copied());
-    let al = best_audio_alignment(&a, &b, 50);
+    let al = best_audio_alignment(&a, &b, 50, 0);
     assert_eq!((al.shift, al.avg_bits, al.overlap), (-5, 0.0, 60));
 }
 
 #[test]
 fn audio_below_min_overlap_returns_sentinel() {
-    let al = best_audio_alignment(&[1u32, 2, 3], &[1u32, 2, 3], 50);
+    let al = best_audio_alignment(&[1u32, 2, 3], &[1u32, 2, 3], 50, 0);
     assert_eq!(al.avg_bits, f32::MAX);
     assert_eq!(al.overlap, 0);
 }
@@ -57,16 +57,16 @@ fn audio_below_min_overlap_returns_sentinel() {
 fn audio_one_bit_per_position_averages_one() {
     let a = vec![0u32; 50];
     let b = vec![1u32; 50];
-    let al = best_audio_alignment(&a, &b, 50);
+    let al = best_audio_alignment(&a, &b, 50, 0);
     assert_eq!(al.overlap, 50);
     assert_eq!(al.avg_bits, 1.0);
 }
 
 #[test]
 fn audio_empty_inputs_are_safe() {
-    assert_eq!(best_audio_alignment(&[], &[1u32], 1).overlap, 0);
-    assert_eq!(best_audio_alignment(&[1u32], &[], 1).overlap, 0);
-    assert_eq!(best_audio_alignment(&[], &[], 1).overlap, 0);
+    assert_eq!(best_audio_alignment(&[], &[1u32], 1, 0).overlap, 0);
+    assert_eq!(best_audio_alignment(&[1u32], &[], 1, 0).overlap, 0);
+    assert_eq!(best_audio_alignment(&[], &[], 1, 0).overlap, 0);
 }
 
 // ---------------------------------------------------------------------------

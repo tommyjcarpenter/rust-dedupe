@@ -14,12 +14,22 @@
 //! ```text
 //! visual_avg <= near_identical_visual_bits        -> duplicate (vision alone)
 //! visual_avg <= threshold_bits, and audio agrees  -> duplicate (corroborated)
+//! audio_avg  <= audio_alone_bits                  -> duplicate (audio alone, opt-in)
 //! anything else                                   -> not a duplicate
 //! ```
 //!
-//! Audio never admits a pair by itself. Clips can share a soundtrack — the same backing track, the same room
-//! tone — while showing entirely different footage, so treating an audio match as sufficient produces false
-//! positives in bulk. Audio only confirms what the visual signal already put in range.
+//! By default audio does not admit a pair by itself. Clips can share a soundtrack — the same backing track, the
+//! same room tone — while showing entirely different footage, so treating an ordinary audio match as sufficient
+//! produces false positives in bulk. At the corroboration bar, audio only confirms what the visual signal
+//! already put in range.
+//!
+//! The third line is the opt-in exception, off unless [`DedupParams::audio_alone_bits`] is set. It exists
+//! because a coarse frame hash cannot see through a reframe at all: a de-pillarboxed crop of a clip and a
+//! smaller copy of that same clip read ~20 of 64 bits apart — indistinguishable from unrelated footage — while
+//! their audio reads under 1 of 32. No ceiling admits those pairs, because the number the ceiling bounds is
+//! noise. The bar for admitting alone is set far tighter than the bar for corroborating, and the resulting
+//! verdict is reported separately ([`DupeVerdict::AudioNearIdentical`]) so a consumer can act on it differently
+//! — flagging it is safe, deleting on it is not.
 //!
 //! Near-identical is also the only route for a silent clip, which by definition has no audio to corroborate with.
 //!
@@ -50,6 +60,14 @@ pub enum DupeVerdict {
     /// The visual match was within the outer threshold but not near-identical, and the audio agreed the two
     /// clips are the same footage.
     AudioCorroborated,
+    /// The audio was near-identical on its own, at a bar far tighter than corroboration asks for, and the
+    /// visual signal did not admit the pair — usually because it could not see the content at all. Only
+    /// reachable when [`DedupParams::audio_alone_bits`] is enabled.
+    ///
+    /// Kept distinct from [`DupeVerdict::AudioCorroborated`] because the evidence really is weaker: nothing
+    /// confirmed the picture. A consumer that deletes on a duplicate verdict should treat this tier as
+    /// review-not-delete, and one that flags should say which signal decided.
+    AudioNearIdentical,
 }
 
 /// Is this pair's audio worth scoring? True when the visual distance lands between the near-identical floor and
@@ -71,6 +89,17 @@ pub enum DupeVerdict {
 /// assert!(!needs_audio_corroboration(20.0, &params)); // never qualifies
 /// ```
 pub fn needs_audio_corroboration(visual_avg: f32, params: &DedupParams) -> bool {
+    /* With the audio-alone tier enabled, audio can admit a pair the visual rule rejects OUTRIGHT, not just one
+    sitting in the corroboration band — so the set of pairs worth scoring widens to everything the visual rule
+    does not already admit. Without this the tier could never fire: the pairs it exists for are exactly the ones
+    past the ceiling, and those are the ones the band excludes. Consumers should expect more audio alignments
+    once they turn it on. */
+    if audio_alone_enabled(params)
+        && visual_avg.is_finite()
+        && visual_rule(visual_avg, None, params).is_none()
+    {
+        return true;
+    }
     /* Mirrors `classify`'s structure, and for the same reason: phrasing both bounds as "within" fails closed on
     a non-finite one. A NaN floor makes `visual_avg > floor` false, which would report that audio is not worth
     scoring for a pair whose verdict audio actually decides — starving it and silently dropping the match. */
@@ -81,6 +110,13 @@ pub fn needs_audio_corroboration(visual_avg: f32, params: &DedupParams) -> bool 
     // about rather than merely a subset of it.
     let audio_can_corroborate = params.audio_threshold_bits.is_finite();
     within_ceiling && !within_near_identical && audio_can_corroborate
+}
+
+/* Whether the audio-alone tier is switched on. A non-finite bound can never be cleared by a real distance, so
+the default `NEG_INFINITY` reads as "off" and an accidental `NAN` fails closed the same way rather than opening
+the tier to everything. */
+fn audio_alone_enabled(params: &DedupParams) -> bool {
+    params.audio_alone_bits.is_finite()
 }
 
 /// Decide whether a pair is a duplicate, and on what evidence.
@@ -126,12 +162,36 @@ pub fn classify(
     audio_avg: Option<f32>,
     params: &DedupParams,
 ) -> Option<DupeVerdict> {
+    /* The visual-anchored rule is asked FIRST, so enabling the audio-alone tier is purely additive: no pair
+    that qualifies today changes its verdict or its reason, and a visually near-identical pair keeps reporting
+    `NearIdentical` rather than being relabelled by its audio. The tier only ever converts a `None`. */
+    visual_rule(visual_avg, audio_avg, params).or_else(|| {
+        /* A non-finite VISUAL distance is a malformed measurement rather than a far one, and the crate fails
+        closed on those everywhere else, so the tier declines it too. The no-alignment sentinel (`f32::MAX`) is
+        finite and does reach the tier, which is deliberate: "the frame hash saw nothing" is exactly the state
+        this tier exists to rescue. */
+        let admits = audio_alone_enabled(params)
+            && visual_avg.is_finite()
+            // Phrased as "within" so a non-finite distance fails closed, matching `visual_rule`.
+            && audio_avg.is_some_and(|audio| audio.is_finite() && audio <= params.audio_alone_bits);
+        admits.then_some(DupeVerdict::AudioNearIdentical)
+    })
+}
+
+/* The visual-anchored rule: vision alone when near-identical, vision plus agreeing audio inside the ceiling,
+otherwise nothing. This is the whole of `classify` when the audio-alone tier is off, and it is also the
+predicate `needs_audio_corroboration` consults to ask "would the visual rule admit this pair already?" */
+fn visual_rule(
+    visual_avg: f32,
+    audio_avg: Option<f32>,
+    params: &DedupParams,
+) -> Option<DupeVerdict> {
     /* The outer ceiling is enforced first so it always binds. Checking near-identical first would let a
     configuration with `near_identical_visual_bits > threshold_bits` admit a pair the ceiling rejects.
 
     Phrased as "not within the ceiling" rather than "past the ceiling" so it fails closed on a non-finite bound:
     every comparison against NaN is false, so `visual_avg > NaN` would skip the return and leave the pair to be
-    decided by its audio alone, which the rule never permits. The same phrasing rejects a non-finite distance. */
+    decided by its audio alone, which this rule never permits. The same phrasing rejects a non-finite distance. */
     let within_ceiling = visual_avg.is_finite() && visual_avg <= params.threshold_bits;
     if !within_ceiling {
         return None;
@@ -385,6 +445,15 @@ mod tests {
                 audio_threshold_bits: f32::NAN,
                 ..params()
             },
+            /* With the tier on the band widens to everything the visual rule doesn't already admit, including
+            past the ceiling. Holding the invariant here is what stops a consumer skipping the audio alignment
+            for exactly the pairs the tier was added for — the failure would be silent, since a pair whose audio
+            was never scored looks identical to one whose audio disagreed. */
+            tier_params(),
+            DedupParams {
+                audio_alone_bits: f32::NAN,
+                ..params()
+            },
         ];
         for p in configs {
             for visual in [0.0f32, 3.0, 3.01, 8.0, 10.0, 10.01, 64.0, f32::NAN] {
@@ -396,6 +465,113 @@ mod tests {
                     "visual={visual} params={p:?}"
                 );
             }
+        }
+    }
+
+    /// `params()` with the audio-alone tier switched on at a bar tighter than corroboration's.
+    fn tier_params() -> DedupParams {
+        DedupParams {
+            audio_alone_bits: 3.0,
+            ..params()
+        }
+    }
+
+    #[test]
+    fn the_tier_is_off_by_default() {
+        /* The whole point of the NEG_INFINITY default: an existing consumer picks up the new field without any
+        verdict moving. Perfect audio past the ceiling still admits nothing. */
+        let p = DedupParams::default();
+        assert!(!p.audio_alone_bits.is_finite());
+        assert_eq!(classify(20.0, Some(0.0), &p), None);
+        assert_eq!(classify(64.0, Some(0.0), &p), None);
+    }
+
+    #[test]
+    fn audio_alone_admits_past_the_ceiling() {
+        // The measured case: a reframed copy reads ~20 of 64 bits visually and under 1 of 32 on audio.
+        assert_eq!(
+            classify(20.1, Some(0.9), &tier_params()),
+            Some(DupeVerdict::AudioNearIdentical)
+        );
+        assert_eq!(
+            classify(18.0, Some(2.5), &tier_params()),
+            Some(DupeVerdict::AudioNearIdentical)
+        );
+    }
+
+    #[test]
+    fn audio_alone_bound_is_inclusive_and_binds() {
+        assert_eq!(
+            classify(20.0, Some(3.0), &tier_params()),
+            Some(DupeVerdict::AudioNearIdentical)
+        );
+        // Just past the tier bar, and past the ceiling, so nothing admits it.
+        assert_eq!(classify(20.0, Some(3.01), &tier_params()), None);
+    }
+
+    #[test]
+    fn the_tier_is_tighter_than_corroboration() {
+        /* Corroboration accepts 2.0 bits of audio; admitting alone must not. Otherwise the tier would silently
+        widen every corroborated pair into an audio-only one and the distinction stops meaning anything. */
+        let p = DedupParams {
+            audio_alone_bits: 1.0,
+            ..params()
+        };
+        assert_eq!(
+            classify(8.0, Some(2.0), &p),
+            Some(DupeVerdict::AudioCorroborated),
+            "inside the ceiling, corroboration still applies at its own looser bar"
+        );
+        assert_eq!(
+            classify(20.0, Some(2.0), &p),
+            None,
+            "past the ceiling, only the tighter tier bar can admit"
+        );
+    }
+
+    #[test]
+    fn the_tier_never_relabels_a_pair_the_visual_rule_already_admits() {
+        /* The tier is additive: it converts `None`, never an existing verdict. A visually near-identical pair
+        with perfect audio must keep reporting why it really qualified. */
+        assert_eq!(
+            classify(1.0, Some(0.0), &tier_params()),
+            Some(DupeVerdict::NearIdentical)
+        );
+        assert_eq!(
+            classify(8.0, Some(0.0), &tier_params()),
+            Some(DupeVerdict::AudioCorroborated)
+        );
+    }
+
+    #[test]
+    fn the_tier_declines_a_non_finite_visual_but_accepts_the_no_match_sentinel() {
+        /* NaN is a malformed measurement, not a distant one, and the crate fails closed on those. `f32::MAX` is
+        the "no alignment qualified" sentinel — finite, and exactly the state the tier exists to rescue. */
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(classify(bad, Some(0.0), &tier_params()), None, "{bad}");
+        }
+        assert_eq!(
+            classify(Alignment::NO_MATCH.avg_bits, Some(0.0), &tier_params()),
+            Some(DupeVerdict::AudioNearIdentical)
+        );
+    }
+
+    #[test]
+    fn the_tier_declines_a_non_finite_audio_distance() {
+        assert_eq!(classify(20.0, Some(f32::NAN), &tier_params()), None);
+        assert_eq!(classify(20.0, None, &tier_params()), None);
+    }
+
+    #[test]
+    fn a_non_finite_tier_bound_leaves_the_tier_off() {
+        // Fails closed the same way the other bounds do, rather than opening the tier to everything.
+        for bad in [f32::NAN, f32::INFINITY] {
+            let p = DedupParams {
+                audio_alone_bits: bad,
+                ..params()
+            };
+            assert_eq!(classify(20.0, Some(0.0), &p), None, "{bad}");
+            assert!(!needs_audio_corroboration(20.0, &p), "{bad}");
         }
     }
 
