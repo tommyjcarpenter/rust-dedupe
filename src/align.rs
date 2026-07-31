@@ -142,6 +142,54 @@ pub(crate) fn hamming64_dist(a: &u64, b: &u64) -> u32 {
     (a ^ b).count_ones()
 }
 
+/* Score one aligned window: `(elements scored, total bits)`. `masks` is `None` when the motion
+gate is off.
+
+The gate is branched on ONCE per window rather than once per element. With the gate off the mask
+is all-true by construction, so consulting it would add two loads, a branch and a conditional
+counter increment to every element of an O(len_a * len_b) sweep — and would stop the ungated arm
+being the plain summation the compiler can vectorize. Shared by both signals, and generic over
+the element's distance, so the fast path cannot exist on one and quietly go missing on the
+other. */
+pub(crate) fn score_window<T>(
+    a: &[T],
+    b: &[T],
+    masks: Option<(&[bool], &[bool])>,
+    dist: impl Fn(&T, &T) -> u32,
+) -> (usize, u64) {
+    // u64 accumulator: a long overlap can sum past u32::MAX bits (overlap up to i32::MAX,
+    // times the element width).
+    let Some((ma, mb)) = masks else {
+        let total: u64 = a.iter().zip(b).map(|(x, y)| u64::from(dist(x, y))).sum();
+        return (a.len(), total);
+    };
+    let mut scored = 0usize;
+    let mut total = 0u64;
+    for (((x, y), &am), &bm) in a.iter().zip(b).zip(ma).zip(mb) {
+        if am || bm {
+            scored += 1;
+            total += u64::from(dist(x, y));
+        }
+    }
+    (scored, total)
+}
+
+/* Both sequences' moving masks, or `None` when the gate is off. Built once per pair, outside
+the shift loop; `score_window` reads the slice of each that a given shift covers. */
+pub(crate) fn masks_for<T>(
+    a: &[T],
+    b: &[T],
+    motion_bits: u32,
+    dist: impl Fn(&T, &T) -> u32 + Copy,
+) -> Option<(Vec<bool>, Vec<bool>)> {
+    (motion_bits > 0).then(|| {
+        (
+            moving_mask(a, motion_bits, dist),
+            moving_mask(b, motion_bits, dist),
+        )
+    })
+}
+
 /// Find the best alignment of `b` against `a` by sliding `b`'s hash sequence
 /// and minimizing the average Hamming distance per scored frame.
 ///
@@ -180,8 +228,7 @@ pub fn best_alignment(a: &[u64], b: &[u64], min_overlap: usize, motion_bits: u32
     if max_pos < max_neg {
         return Alignment::NO_MATCH;
     }
-    let moving_a = moving_mask(a, motion_bits, hamming64_dist);
-    let moving_b = moving_mask(b, motion_bits, hamming64_dist);
+    let masks = masks_for(a, b, motion_bits, hamming64_dist);
     let mut best = Alignment::NO_MATCH;
     for shift in max_neg..=max_pos {
         let (a_start, b_start) = if shift >= 0 {
@@ -193,20 +240,15 @@ pub fn best_alignment(a: &[u64], b: &[u64], min_overlap: usize, motion_bits: u32
         if overlap < min_overlap {
             continue;
         }
-        let mut moving_overlap = 0usize;
-        // u64 accumulator: a long overlap can sum more than u32::MAX bits
-        // (overlap up to i32::MAX, times 64 bits per frame).
-        let mut total_bits = 0u64;
         let a_win = &a[a_start..a_start + overlap];
         let b_win = &b[b_start..b_start + overlap];
-        let ma = &moving_a[a_start..a_start + overlap];
-        let mb = &moving_b[b_start..b_start + overlap];
-        for (((&ah, &bh), &am), &bm) in a_win.iter().zip(b_win).zip(ma).zip(mb) {
-            if am || bm {
-                moving_overlap += 1;
-                total_bits += u64::from((ah ^ bh).count_ones());
-            }
-        }
+        let win_masks = masks.as_ref().map(|(ma, mb)| {
+            (
+                &ma[a_start..a_start + overlap],
+                &mb[b_start..b_start + overlap],
+            )
+        });
+        let (moving_overlap, total_bits) = score_window(a_win, b_win, win_masks, hamming64_dist);
         if moving_overlap < min_overlap {
             continue;
         }

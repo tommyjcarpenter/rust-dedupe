@@ -75,8 +75,7 @@ pub fn best_audio_alignment(
     if max_pos < max_neg {
         return Alignment::NO_MATCH;
     }
-    let moving_a = crate::align::moving_mask(a, motion_bits, hamming32_dist);
-    let moving_b = crate::align::moving_mask(b, motion_bits, hamming32_dist);
+    let masks = crate::align::masks_for(a, b, motion_bits, hamming32_dist);
     let mut best = Alignment::NO_MATCH;
     for shift in max_neg..=max_pos {
         let (a_start, b_start) = if shift >= 0 {
@@ -88,20 +87,16 @@ pub fn best_audio_alignment(
         if overlap < min_overlap {
             continue;
         }
-        let mut moving_overlap = 0usize;
-        // u64 accumulator: a long overlap can sum more than u32::MAX bits
-        // (overlap up to i32::MAX, times 32 bits per sub-fingerprint).
-        let mut total_bits = 0u64;
         let a_win = &a[a_start..a_start + overlap];
         let b_win = &b[b_start..b_start + overlap];
-        let ma = &moving_a[a_start..a_start + overlap];
-        let mb = &moving_b[b_start..b_start + overlap];
-        for (((&ah, &bh), &am), &bm) in a_win.iter().zip(b_win).zip(ma).zip(mb) {
-            if am || bm {
-                moving_overlap += 1;
-                total_bits += u64::from(hamming32(ah, bh));
-            }
-        }
+        let win_masks = masks.as_ref().map(|(ma, mb)| {
+            (
+                &ma[a_start..a_start + overlap],
+                &mb[b_start..b_start + overlap],
+            )
+        });
+        let (moving_overlap, total_bits) =
+            crate::align::score_window(a_win, b_win, win_masks, hamming32_dist);
         if moving_overlap < min_overlap {
             continue;
         }
