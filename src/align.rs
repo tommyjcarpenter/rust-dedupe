@@ -176,8 +176,8 @@ pub(crate) fn score_window<T>(
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RunMatch {
-    /// Offset of `b` relative to `a`, as in [`Alignment::shift`].
-    pub offset: i32,
+    /// Offset of `b` relative to `a`, with the same meaning and sign as [`Alignment::shift`].
+    pub shift: i32,
     /// Where the run starts in `a`.
     pub run_start_a: usize,
     /// Where the run starts in `b`.
@@ -190,8 +190,11 @@ pub struct RunMatch {
     pub run_scored: usize,
     /// Average distance over the run's scored elements: whether this stretch is shared content.
     pub run_avg_bits: f32,
-    /// Average over the WHOLE intersection at the same offset — what [`best_alignment`] reports
-    /// there. Carried so a caller can see the contrast that motivates this: a low
+    /// Average over the WHOLE intersection AT THIS SHIFT — the per-shift number, not
+    /// [`best_alignment`]'s result. That minimizes over every shift, so its `avg_bits` is a lower
+    /// bound on this and usually comes from a different shift entirely.
+    ///
+    /// Carried so a caller can see the contrast that motivates the run scan at all: a low
     /// `run_avg_bits` beside a high `full_avg_bits` is exactly a partial overlap.
     pub full_avg_bits: f32,
 }
@@ -267,11 +270,11 @@ pub(crate) fn best_run_generic<T>(
     }
     let masks = masks_for(a, b, motion_bits, dist);
     let mut best: Option<RunMatch> = None;
-    for offset in max_neg..=max_pos {
-        let (a_start, b_start) = if offset >= 0 {
-            (offset as usize, 0)
+    for shift in max_neg..=max_pos {
+        let (a_start, b_start) = if shift >= 0 {
+            (shift as usize, 0)
         } else {
-            (0, (-offset) as usize)
+            (0, (-shift) as usize)
         };
         let overlap = (a.len() - a_start).min(b.len() - b_start);
         if overlap < w {
@@ -294,7 +297,7 @@ pub(crate) fn best_run_generic<T>(
         }
         let (scored, total) = score_window(a_win, b_win, win_masks, dist);
         best = Some(RunMatch {
-            offset,
+            shift,
             run_start_a: a_start + run_off,
             run_start_b: b_start + run_off,
             run_len,
@@ -717,7 +720,7 @@ mod tests {
         );
 
         let run = best_matching_run(&a, &b, &p).expect("a run is found");
-        assert_eq!(run.offset, 0);
+        assert_eq!(run.shift, 0);
         assert_eq!(run.run_start_a, 0);
         assert_eq!(run.run_start_b, 0);
         assert_eq!(run.run_avg_bits, 0.0, "the shared opening is exact");
@@ -755,7 +758,7 @@ mod tests {
         assert_eq!(run.run_avg_bits, 0.0);
         assert_eq!(run.run_start_a, 25);
         assert_eq!(run.run_start_b, 10);
-        assert_eq!(run.offset, 15, "b sits 15 elements later in a's frame");
+        assert_eq!(run.shift, 15, "b sits 15 elements later in a's frame");
     }
 
     #[test]
@@ -767,7 +770,7 @@ mod tests {
             run.full_avg_bits, 0.0,
             "nothing to contrast when it all matches"
         );
-        assert_eq!(run.offset, 0);
+        assert_eq!(run.shift, 0);
     }
 
     #[test]
