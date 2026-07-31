@@ -8,10 +8,13 @@
 //! match corroborates a borderline visual match.
 //!
 //! The alignment is the same sliding minimum-average-Hamming idea as
-//! [`crate::align::best_alignment`], operating on 32-bit values, with no motion
-//! gate. Edges here are not meant to stand alone: a caller treats a strong
-//! audio match as corroboration of at least weak visual similarity, never as a
-//! duplicate verdict on its own.
+//! [`crate::align::best_alignment`], on 32-bit values, with the same optional
+//! motion gate ([`DedupParams::audio_motion_bits`]) — silence fingerprints to a
+//! constant run and would otherwise match any other silent stretch.
+//!
+//! Edges here are corroboration by default. The exception is
+//! [`DedupParams::audio_alone_bits`], a much tighter bar at which audio admits a
+//! pair on its own, for content a coarse frame hash cannot see at all.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -38,9 +41,17 @@ pub fn hamming32(a: u32, b: u32) -> u32 {
 /// sequence and minimizing the average Hamming distance over the overlap.
 ///
 /// Only alignments with overlap at least `min_overlap` are considered. Returns
-/// [`Alignment::NO_MATCH`] when none qualifies. Unlike the visual path there is
-/// no motion gate; every overlapping sub-fingerprint is scored.
-pub fn best_audio_alignment(a: &[u32], b: &[u32], min_overlap: usize) -> Alignment {
+/// [`Alignment::NO_MATCH`] when none qualifies.
+///
+/// `motion_bits` is the audio motion gate: only sub-fingerprints where either side
+/// differs from a neighbor by that much are scored or counted toward the overlap, so a
+/// constant run (silence, a held tone) cannot carry an alignment. `0` disables it.
+pub fn best_audio_alignment(
+    a: &[u32],
+    b: &[u32],
+    min_overlap: usize,
+    motion_bits: u32,
+) -> Alignment {
     // At least one overlapping sub-fingerprint; treat 0 as 1 so the average is
     // never computed over an empty (0/0 -> NaN) overlap.
     let min_overlap = min_overlap.max(1);
@@ -58,6 +69,7 @@ pub fn best_audio_alignment(a: &[u32], b: &[u32], min_overlap: usize) -> Alignme
     if max_pos < max_neg {
         return Alignment::NO_MATCH;
     }
+    let masks = crate::align::masks_for(a, b, motion_bits, hamming32_dist);
     let mut best = Alignment::NO_MATCH;
     for shift in max_neg..=max_pos {
         let (a_start, b_start) = if shift >= 0 {
@@ -69,23 +81,34 @@ pub fn best_audio_alignment(a: &[u32], b: &[u32], min_overlap: usize) -> Alignme
         if overlap < min_overlap {
             continue;
         }
-        // u64 accumulator: a long overlap can sum more than u32::MAX bits
-        // (overlap up to i32::MAX, times 32 bits per sub-fingerprint).
-        let total_bits: u64 = a[a_start..a_start + overlap]
-            .iter()
-            .zip(&b[b_start..b_start + overlap])
-            .map(|(&x, &y)| u64::from((x ^ y).count_ones()))
-            .sum();
-        let avg = (total_bits as f64 / overlap as f64) as f32;
+        let a_win = &a[a_start..a_start + overlap];
+        let b_win = &b[b_start..b_start + overlap];
+        let win_masks = masks.as_ref().map(|(ma, mb)| {
+            (
+                &ma[a_start..a_start + overlap],
+                &mb[b_start..b_start + overlap],
+            )
+        });
+        let (moving_overlap, total_bits) =
+            crate::align::score_window(a_win, b_win, win_masks, hamming32_dist);
+        if moving_overlap < min_overlap {
+            continue;
+        }
+        let avg = (total_bits as f64 / moving_overlap as f64) as f32;
         if avg < best.avg_bits {
             best = Alignment {
                 shift,
                 avg_bits: avg,
-                overlap,
+                overlap: moving_overlap,
             };
         }
     }
     best
+}
+
+/// [`hamming32`] over references, for [`crate::align::moving_mask`].
+fn hamming32_dist(a: &u32, b: &u32) -> u32 {
+    hamming32(*a, *b)
 }
 
 /// Score a single pair of sub-fingerprint sequences. `(avg_bits, overlap)`, or
@@ -103,7 +126,7 @@ pub fn score_audio(a: &[u32], b: &[u32], params: &DedupParams) -> Option<(f32, u
         .max(params.audio_min_overlap_hard_floor)
         .min(a.len())
         .min(b.len());
-    let alignment = best_audio_alignment(a, b, effective_min);
+    let alignment = best_audio_alignment(a, b, effective_min, params.audio_motion_bits);
     if alignment.overlap < effective_min {
         return None;
     }
@@ -175,7 +198,7 @@ where
                 .max(params.audio_min_overlap_hard_floor)
                 .min(fa.len())
                 .min(fb.len());
-            let alignment = best_audio_alignment(fa, fb, effective_min);
+            let alignment = best_audio_alignment(fa, fb, effective_min, params.audio_motion_bits);
             if alignment.overlap < effective_min || alignment.avg_bits > params.audio_threshold_bits
             {
                 continue;
@@ -199,7 +222,7 @@ mod tests {
     #[test]
     fn perfect_match_at_zero_shift() {
         let seq: Vec<u32> = (0..60).collect();
-        let al = best_audio_alignment(&seq, &seq, 50);
+        let al = best_audio_alignment(&seq, &seq, 50, 0);
         assert_eq!(al.shift, 0);
         assert_eq!(al.avg_bits, 0.0);
         assert_eq!(al.overlap, 60);
@@ -209,7 +232,7 @@ mod tests {
     fn one_bit_per_position_averages_one() {
         let a = vec![0u32; 50];
         let b = vec![1u32; 50];
-        let al = best_audio_alignment(&a, &b, 50);
+        let al = best_audio_alignment(&a, &b, 50, 0);
         assert_eq!(al.overlap, 50);
         assert_eq!(al.avg_bits, 1.0);
     }
@@ -218,9 +241,75 @@ mod tests {
     fn zero_min_overlap_is_coerced_and_finite() {
         // min_overlap = 0 must not produce a 0/0 NaN; it is treated as 1.
         let seq: Vec<u32> = (0..40).collect();
-        let al = best_audio_alignment(&seq, &seq, 0);
+        let al = best_audio_alignment(&seq, &seq, 0, 0);
         assert!(al.avg_bits.is_finite());
         assert_eq!(al.avg_bits, 0.0);
         assert!(al.overlap >= 1);
+    }
+
+    /* A sub-fingerprint sequence whose every consecutive pair differs by many bits, i.e. real
+    audio as far as the motion gate is concerned. */
+    fn moving_fp(n: u32) -> Vec<u32> {
+        (0..n).map(|i| i.wrapping_mul(0x9E37_79B9)).collect()
+    }
+
+    #[test]
+    fn the_gate_refuses_a_pair_that_shares_only_silence() {
+        /* Digital silence fingerprints to a constant run. Ungated, two such stretches align at 0
+        bits and are the strongest possible match, which would make every silent clip a duplicate
+        of every other one. Gated, nothing is scored and there is no alignment at all. */
+        let silence = [0u32; 60];
+        let ungated = best_audio_alignment(&silence, &silence, 50, 0);
+        assert_eq!(ungated.avg_bits, 0.0, "ungated, silence is a perfect match");
+        assert!(ungated.matched());
+
+        let gated = best_audio_alignment(&silence, &silence, 50, 2);
+        assert_eq!(gated, Alignment::NO_MATCH);
+    }
+
+    #[test]
+    fn the_gate_leaves_real_audio_alone() {
+        // Every frame moves, so gating changes neither the average nor the overlap.
+        let seq = moving_fp(60);
+        assert_eq!(
+            best_audio_alignment(&seq, &seq, 50, 2),
+            best_audio_alignment(&seq, &seq, 50, 0)
+        );
+    }
+
+    #[test]
+    fn the_gate_excludes_a_trailing_silent_run_from_the_average() {
+        /* Real audio followed by silence. The silent tail matches at 0 bits and would otherwise
+        drag the average down, flattering a pair whose actual content differs. Gated, only the
+        moving half is scored, so the average reports the content and the overlap counts it. */
+        let quiet = [0u32; 40];
+        let a: Vec<u32> = moving_fp(40)
+            .into_iter()
+            .chain(quiet.iter().copied())
+            .collect();
+        let mut b = a.clone();
+        // Flip one bit in every moving frame: 1 bit/frame over the content, 0 over the silence.
+        for x in b.iter_mut().take(40) {
+            *x ^= 1;
+        }
+        let ungated = best_audio_alignment(&a, &b, 30, 0);
+        assert_eq!(ungated.overlap, 80);
+        assert_eq!(ungated.avg_bits, 0.5, "40 bits spread over all 80 frames");
+
+        /* 41, not 40: `moving_mask` counts an element that differs from EITHER neighbour, so the
+        first silent frame is counted on the strength of the moving frame before it. That boundary
+        rule is deliberate — it stops an off-by-one dropping a minimum-length clip below the
+        overlap floor — and the one extra frame contributes 0 bits, so it only dilutes by 1/41. */
+        let gated = best_audio_alignment(&a, &b, 30, 2);
+        assert_eq!(gated.overlap, 41, "the moving half plus one boundary frame");
+        assert_eq!(
+            gated.avg_bits,
+            (40.0f64 / 41.0) as f32,
+            "40 bits over the 41 frames that scored"
+        );
+        assert!(
+            gated.avg_bits > ungated.avg_bits,
+            "excluding the silence stops it flattering the pair"
+        );
     }
 }

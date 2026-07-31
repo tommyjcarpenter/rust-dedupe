@@ -160,7 +160,21 @@ let frames = Extractor::default().frame_hashes(Path::new("clip.mp4"), 0.0, 60, N
 Everything that affects matching lives in `DedupParams`: the sample window,
 the visual/audio thresholds, the overlap floors, and `motion_bits`. Setting
 `motion_bits = 0` turns the motion gate off and scores a plain average over
-every overlapping frame.
+every overlapping frame. `audio_motion_bits` is the same gate on the audio
+signal, off by default; silence fingerprints to a constant run, so without it
+two silent stretches align at ~0 bits and match anything.
+
+`audio_alone_bits` is off by default and opts into a third verdict tier, in
+which audio admits a pair on its own. A frame hash cannot see through a
+reframe — a de-pillarboxed crop and a smaller copy of the same clip read ~20
+of 64 bits apart — so for those pairs the visual ceiling bounds noise and
+nothing admits them.
+
+Set it far tighter than `audio_threshold_bits`: admitting a pair alone is a
+higher bar than corroborating one already in range. Clips can share a
+soundtrack over unrelated footage, so a consumer that deletes should treat
+`DupeVerdict::AudioNearIdentical` as review-not-delete. Turning the tier on
+also widens `needs_audio_corroboration`, so expect more audio alignments.
 
 The one thing that is *not* tunable is the pixel-side sampling geometry
 (`SAMPLE_W` = 9, `SAMPLE_H` = 8, `SAMPLE_FPS` = 6). `dhash_9x8` and those
