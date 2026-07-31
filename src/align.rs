@@ -117,9 +117,8 @@ clip below the floor), while the interior of a frozen run counts zero.
 `motion_bits == 0` disables the gate entirely: every element is scored, including
 a single-element sequence (which has no neighbor to compare against).
 
-Generic over the element and its distance so the audio path shares this rather
-than growing a near-identical copy — a frozen run means the same thing on either
-signal (a repeated frame, or digital silence fingerprinting to a constant). */
+Generic over the element so the audio path shares it: a frozen run means the same
+thing on either signal, a repeated frame or silence fingerprinting to a constant. */
 pub(crate) fn moving_mask<T>(
     seq: &[T],
     motion_bits: u32,
@@ -142,23 +141,17 @@ pub(crate) fn hamming64_dist(a: &u64, b: &u64) -> u32 {
     (a ^ b).count_ones()
 }
 
-/* Score one aligned window: `(elements scored, total bits)`. `masks` is `None` when the motion
-gate is off.
-
-The gate is branched on ONCE per window rather than once per element. With the gate off the mask
-is all-true by construction, so consulting it would add two loads, a branch and a conditional
-counter increment to every element of an O(len_a * len_b) sweep — and would stop the ungated arm
-being the plain summation the compiler can vectorize. Shared by both signals, and generic over
-the element's distance, so the fast path cannot exist on one and quietly go missing on the
-other. */
+/* Score one aligned window: `(elements scored, total bits)`. `masks` is `None` when the gate is
+off, and is branched on once per window rather than once per element — an all-true mask is worth
+nothing per element and costs the ungated arm its vectorization over an O(len_a * len_b) sweep.
+Shared by both signals so the fast path can't go missing on one of them. */
 pub(crate) fn score_window<T>(
     a: &[T],
     b: &[T],
     masks: Option<(&[bool], &[bool])>,
     dist: impl Fn(&T, &T) -> u32,
 ) -> (usize, u64) {
-    // u64 accumulator: a long overlap can sum past u32::MAX bits (overlap up to i32::MAX,
-    // times the element width).
+    // u64 accumulator: a long overlap can sum past u32::MAX bits.
     let Some((ma, mb)) = masks else {
         let total: u64 = a.iter().zip(b).map(|(x, y)| u64::from(dist(x, y))).sum();
         return (a.len(), total);
@@ -174,8 +167,7 @@ pub(crate) fn score_window<T>(
     (scored, total)
 }
 
-/* Both sequences' moving masks, or `None` when the gate is off. Built once per pair, outside
-the shift loop; `score_window` reads the slice of each that a given shift covers. */
+/// Both sequences' moving masks, or `None` when the gate is off. Built once per pair.
 pub(crate) fn masks_for<T>(
     a: &[T],
     b: &[T],

@@ -8,16 +8,13 @@
 //! match corroborates a borderline visual match.
 //!
 //! The alignment is the same sliding minimum-average-Hamming idea as
-//! [`crate::align::best_alignment`], operating on 32-bit values, with the same
-//! optional motion gate ([`DedupParams::audio_motion_bits`], off by default):
-//! digital silence fingerprints to a constant run, which would otherwise align
-//! against any other silent stretch at ~0 bits.
+//! [`crate::align::best_alignment`], on 32-bit values, with the same optional
+//! motion gate ([`DedupParams::audio_motion_bits`]) — silence fingerprints to a
+//! constant run and would otherwise match any other silent stretch.
 //!
-//! Edges here are corroboration by default: a caller treats a strong audio
-//! match as confirming at least weak visual similarity. The one exception is
-//! [`DedupParams::audio_alone_bits`], a much tighter bar at which audio admits
-//! a pair on its own — for content whose reframing puts it beyond what a coarse
-//! frame hash can see at all.
+//! Edges here are corroboration by default. The exception is
+//! [`DedupParams::audio_alone_bits`], a much tighter bar at which audio admits a
+//! pair on its own, for content a coarse frame hash cannot see at all.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -46,12 +43,9 @@ pub fn hamming32(a: u32, b: u32) -> u32 {
 /// Only alignments with overlap at least `min_overlap` are considered. Returns
 /// [`Alignment::NO_MATCH`] when none qualifies.
 ///
-/// `motion_bits` is the audio analogue of the visual motion gate: only
-/// sub-fingerprints where either side differs from a neighbor by at least that
-/// many bits are scored and counted toward the overlap, so a constant run —
-/// digital silence, a held tone — cannot carry an alignment on its own. `0`
-/// disables it, scoring the plain average over every overlapping
-/// sub-fingerprint.
+/// `motion_bits` is the audio motion gate: only sub-fingerprints where either side
+/// differs from a neighbor by that much are scored or counted toward the overlap, so a
+/// constant run (silence, a held tone) cannot carry an alignment. `0` disables it.
 pub fn best_audio_alignment(
     a: &[u32],
     b: &[u32],

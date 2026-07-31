@@ -72,39 +72,22 @@ pub struct DedupParams {
     /// Hard floor below which an audio match is refused regardless of length.
     pub audio_min_overlap_hard_floor: usize,
 
-    /// Sub-fingerprint-to-sub-fingerprint change at or above which audio is
-    /// considered to be MOVING, the audio analogue of `motion_bits`. Digital
-    /// silence fingerprints to a constant run, so two silent clips align at ~0
-    /// bits and would otherwise match anything; gated frames are excluded from
-    /// both the average and the overlap count, so silence cannot satisfy the
-    /// overlap floor on its own either.
-    ///
-    /// Set to `0` to disable the gate, scoring the plain average over all
-    /// overlapping sub-fingerprints. That is the default, so an existing
-    /// consumer's numbers do not move.
+    /// The audio analogue of `motion_bits`. Silence fingerprints to a constant run, so
+    /// without the gate two silent stretches align at ~0 bits and match anything. `0`
+    /// (the default) disables it.
     pub audio_motion_bits: u32,
 
-    /// Average audio distance at or below which the audio signal admits a pair
-    /// ON ITS OWN, without the visual signal agreeing or even being in range.
+    /// Average audio distance at or below which audio admits a pair ON ITS OWN, with no
+    /// visual agreement and no ceiling bounding it.
     ///
-    /// A coarse 64-bit frame hash cannot see through a reframe: a
-    /// de-pillarboxed crop of a clip and a smaller copy of that same clip read
-    /// ~20 of 64 bits apart, indistinguishable from unrelated footage, while
-    /// their audio reads under 1 of 32. Bounding audio's reach on the visual
-    /// distance therefore bounds it on noise, and those pairs are unmatchable
-    /// at any ceiling. This tier is the escape hatch, and it is deliberately
-    /// much tighter than `audio_threshold_bits`: corroborating an
-    /// already-plausible pair is a lower bar than admitting one alone.
+    /// A frame hash cannot see through a reframe — a de-pillarboxed crop and a smaller
+    /// copy of the same clip read ~20 of 64 bits apart — so for those pairs the ceiling
+    /// bounds noise. Set this far tighter than `audio_threshold_bits`: admitting a pair
+    /// alone is a higher bar than corroborating one already in range. Clips can share a
+    /// soundtrack over unrelated footage, so a consumer that DELETES should treat this
+    /// tier as review-not-delete.
     ///
-    /// Callers must weigh what a false positive costs them. Clips can share a
-    /// soundtrack or room tone while showing unrelated footage, so a consumer
-    /// that DELETES on a duplicate verdict should treat this tier as
-    /// review-not-delete; a consumer that only flags can act on it directly.
-    ///
-    /// [`f32::NEG_INFINITY`] (the default) disables the tier: no finite
-    /// distance clears it, so verdicts match the pre-tier rule exactly. A
-    /// non-finite bound never admits anything, so an accidental `NAN` fails
-    /// closed rather than open.
+    /// [`f32::NEG_INFINITY`] (the default) disables it; any non-finite bound fails closed.
     pub audio_alone_bits: f32,
 }
 
