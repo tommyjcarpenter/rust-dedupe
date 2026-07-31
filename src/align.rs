@@ -167,6 +167,165 @@ pub(crate) fn score_window<T>(
     (scored, total)
 }
 
+/// A well-matching stretch found inside an alignment whose overall distance may be poor.
+///
+/// [`Alignment`] answers "are these the same clip", averaging over the whole intersection. That
+/// is the wrong question when two clips share a scene and then diverge: the shared part is
+/// averaged with the part that isn't, and a real overlap vanishes into the mean. This answers
+/// "do these clips share footage, and which part".
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RunMatch {
+    /// Offset of `b` relative to `a`, as in [`Alignment::shift`].
+    pub offset: i32,
+    /// Where the run starts in `a`.
+    pub run_start_a: usize,
+    /// Where the run starts in `b`.
+    pub run_start_b: usize,
+    /// Elements the run spans. Larger than `run_scored` when the motion gate skipped
+    /// something inside it.
+    pub run_len: usize,
+    /// Elements actually scored in the run — always the effective overlap floor, since the run
+    /// is defined as the best window holding exactly that many.
+    pub run_scored: usize,
+    /// Average distance over the run's scored elements: whether this stretch is shared content.
+    pub run_avg_bits: f32,
+    /// Average over the WHOLE intersection at the same offset — what [`best_alignment`] reports
+    /// there. Carried so a caller can see the contrast that motivates this: a low
+    /// `run_avg_bits` beside a high `full_avg_bits` is exactly a partial overlap.
+    pub full_avg_bits: f32,
+}
+
+/* The best-matching run at one offset: `(start, span, avg)`, or `None` when the window never
+holds `w` scored elements. Two pointers over the overlap maintaining a window with exactly `w` of
+them, so the whole sweep stays O(len_a * len_b) — the same cost as the alignment it sits beside.
+
+Exactly `w`, not "at least": minimizing a mean over variable-length windows is a different and
+far more expensive problem, and `w` is already the caller's statement of how much evidence a
+match needs. Leading unscored elements are trimmed so the reported span is the tightest one
+holding the run. */
+fn best_run_at<T>(
+    a_win: &[T],
+    b_win: &[T],
+    masks: Option<(&[bool], &[bool])>,
+    w: usize,
+    dist: &impl Fn(&T, &T) -> u32,
+) -> Option<(usize, usize, f32)> {
+    let scored_at = |i: usize| masks.is_none_or(|(ma, mb)| ma[i] || mb[i]);
+    let dist_at = |i: usize| u64::from(dist(&a_win[i], &b_win[i]));
+    let mut best: Option<(usize, usize, f32)> = None;
+    let mut lo = 0usize;
+    let mut scored = 0usize;
+    let mut sum = 0u64;
+    for hi in 0..a_win.len() {
+        if scored_at(hi) {
+            scored += 1;
+            sum += dist_at(hi);
+        }
+        while scored > w {
+            if scored_at(lo) {
+                scored -= 1;
+                sum -= dist_at(lo);
+            }
+            lo += 1;
+        }
+        if scored < w {
+            continue;
+        }
+        while lo < hi && !scored_at(lo) {
+            lo += 1;
+        }
+        let avg = (sum as f64 / w as f64) as f32;
+        if best.is_none_or(|(_, _, prev)| avg < prev) {
+            best = Some((lo, hi + 1 - lo, avg));
+        }
+    }
+    best
+}
+
+/* Shared core of the run scan. Same offset range and floors as `best_alignment`, but scoring the
+best window at each offset instead of the whole overlap. */
+pub(crate) fn best_run_generic<T>(
+    a: &[T],
+    b: &[T],
+    min_overlap: usize,
+    hard_floor: usize,
+    motion_bits: u32,
+    dist: impl Fn(&T, &T) -> u32 + Copy,
+) -> Option<RunMatch> {
+    if a.len() < hard_floor || b.len() < hard_floor {
+        return None;
+    }
+    let w = min_overlap.max(hard_floor).min(a.len()).min(b.len()).max(1);
+    if a.is_empty() || b.is_empty() || a.len() > i32::MAX as usize || b.len() > i32::MAX as usize {
+        return None;
+    }
+    let max_pos: i32 = a.len() as i32 - w as i32;
+    let max_neg: i32 = w as i32 - b.len() as i32;
+    if max_pos < max_neg {
+        return None;
+    }
+    let masks = masks_for(a, b, motion_bits, dist);
+    let mut best: Option<RunMatch> = None;
+    for offset in max_neg..=max_pos {
+        let (a_start, b_start) = if offset >= 0 {
+            (offset as usize, 0)
+        } else {
+            (0, (-offset) as usize)
+        };
+        let overlap = (a.len() - a_start).min(b.len() - b_start);
+        if overlap < w {
+            continue;
+        }
+        let a_win = &a[a_start..a_start + overlap];
+        let b_win = &b[b_start..b_start + overlap];
+        let win_masks = masks.as_ref().map(|(ma, mb)| {
+            (
+                &ma[a_start..a_start + overlap],
+                &mb[b_start..b_start + overlap],
+            )
+        });
+        let Some((run_off, run_len, run_avg)) = best_run_at(a_win, b_win, win_masks, w, &dist)
+        else {
+            continue;
+        };
+        if best.is_some_and(|prev| run_avg >= prev.run_avg_bits) {
+            continue;
+        }
+        let (scored, total) = score_window(a_win, b_win, win_masks, dist);
+        best = Some(RunMatch {
+            offset,
+            run_start_a: a_start + run_off,
+            run_start_b: b_start + run_off,
+            run_len,
+            run_scored: w,
+            run_avg_bits: run_avg,
+            full_avg_bits: if scored == 0 {
+                f32::MAX
+            } else {
+                (total as f64 / scored as f64) as f32
+            },
+        });
+    }
+    best
+}
+
+/// The best-matching run between two frame-hash sequences, for finding a shared stretch inside
+/// clips that are not the same clip end to end. See [`RunMatch`].
+///
+/// Uses the same floors and motion gate as [`score_visual`], so a run is held to the same
+/// evidence bar as an alignment; only the span it averages over differs.
+pub fn best_matching_run(a: &[u64], b: &[u64], params: &DedupParams) -> Option<RunMatch> {
+    best_run_generic(
+        a,
+        b,
+        params.min_overlap_frames,
+        params.min_overlap_hard_floor,
+        params.motion_bits,
+        hamming64_dist,
+    )
+}
+
 /// Both sequences' moving masks, or `None` when the gate is off. Built once per pair.
 pub(crate) fn masks_for<T>(
     a: &[T],
@@ -522,6 +681,147 @@ mod tests {
         assert!(al.matched());
         assert_eq!(al.avg_bits, 0.0);
         assert_eq!(al.overlap, 1);
+    }
+
+    /* Params with the gate off and a 10-element floor, so the run tests state their own bar
+    rather than inheriting the shipped defaults. */
+    fn run_params(min_overlap: usize) -> DedupParams {
+        DedupParams {
+            min_overlap_frames: min_overlap,
+            min_overlap_hard_floor: min_overlap,
+            motion_bits: 0,
+            ..DedupParams::default()
+        }
+    }
+
+    #[test]
+    fn a_shared_opening_is_found_though_the_clips_diverge() {
+        /* The case the run scan exists for. Both clips open with the same 20 elements and then
+        continue with unrelated content, so they stick out in the SAME direction and the
+        intersection outlasts the shared part. The plain alignment averages 20 matching elements
+        with 40 unrelated ones and sees nothing; the run scan finds the opening. */
+        let shared = moving_seq(20);
+        let a: Vec<u64> = shared.iter().copied().chain(moving_seq(40)).collect();
+        let b: Vec<u64> = shared
+            .iter()
+            .copied()
+            .chain(moving_seq(40).iter().map(|h| !h))
+            .collect();
+        let p = run_params(10);
+
+        let full = best_alignment(&a, &b, p.min_overlap_frames, p.motion_bits);
+        assert!(
+            full.avg_bits > 10.0,
+            "the plain average is diluted past any threshold: {}",
+            full.avg_bits
+        );
+
+        let run = best_matching_run(&a, &b, &p).expect("a run is found");
+        assert_eq!(run.offset, 0);
+        assert_eq!(run.run_start_a, 0);
+        assert_eq!(run.run_start_b, 0);
+        assert_eq!(run.run_avg_bits, 0.0, "the shared opening is exact");
+        assert_eq!(run.run_scored, 10);
+        /* The contrast in one struct, which is the whole point of carrying both: at the run's
+        own offset the whole-overlap mean is still diluted past any threshold. Not compared
+        against `full` above — `best_alignment` minimizes over every offset and can win at a
+        different one, so its number is a floor, not the value at this offset. */
+        assert!(
+            run.full_avg_bits > 10.0,
+            "the same offset is diluted end to end: {}",
+            run.full_avg_bits
+        );
+        assert!(run.full_avg_bits >= full.avg_bits);
+    }
+
+    #[test]
+    fn the_run_is_located_in_the_middle_of_both_clips() {
+        // A shared stretch buried inside both sides — the interior case a plain alignment
+        // cannot isolate, because the intersection is pinned to the shorter clip's length.
+        let shared = moving_seq(15);
+        let a: Vec<u64> = moving_seq(25)
+            .iter()
+            .map(|h| !h)
+            .chain(shared.iter().copied())
+            .chain(moving_seq(25).iter().map(|h| h.rotate_left(7)))
+            .collect();
+        let b: Vec<u64> = moving_seq(10)
+            .iter()
+            .map(|h| h.rotate_left(19))
+            .chain(shared.iter().copied())
+            .chain(moving_seq(30).iter().map(|h| h.rotate_left(3)))
+            .collect();
+        let run = best_matching_run(&a, &b, &run_params(12)).expect("a run is found");
+        assert_eq!(run.run_avg_bits, 0.0);
+        assert_eq!(run.run_start_a, 25);
+        assert_eq!(run.run_start_b, 10);
+        assert_eq!(run.offset, 15, "b sits 15 elements later in a's frame");
+    }
+
+    #[test]
+    fn identical_clips_report_a_perfect_run_and_a_perfect_whole() {
+        let seq = moving_seq(40);
+        let run = best_matching_run(&seq, &seq, &run_params(10)).expect("a run is found");
+        assert_eq!(run.run_avg_bits, 0.0);
+        assert_eq!(
+            run.full_avg_bits, 0.0,
+            "nothing to contrast when it all matches"
+        );
+        assert_eq!(run.offset, 0);
+    }
+
+    #[test]
+    fn unrelated_clips_report_a_run_that_is_still_far() {
+        /* The scan always returns its best window, so the DISTANCE is what rejects a pair, not
+        the absence of a result. A caller that treated `Some` as a match would flag everything. */
+        let a = moving_seq(60);
+        let b: Vec<u64> = moving_seq(60).iter().map(|h| h.rotate_left(31)).collect();
+        let run = best_matching_run(&a, &b, &run_params(10)).expect("still returns its best");
+        assert!(
+            run.run_avg_bits > 10.0,
+            "unrelated content stays far even at its best window: {}",
+            run.run_avg_bits
+        );
+    }
+
+    #[test]
+    fn a_clip_below_the_hard_floor_has_no_run() {
+        let short = moving_seq(5);
+        let long = moving_seq(60);
+        assert_eq!(best_matching_run(&short, &long, &run_params(10)), None);
+        assert_eq!(best_matching_run(&long, &short, &run_params(10)), None);
+    }
+
+    #[test]
+    fn the_motion_gate_keeps_a_static_run_from_becoming_a_match() {
+        /* Without the gate, two clips sharing only a black end card align at 0 bits over it and
+        the run scan reports a perfect match — the same false positive the gate exists to stop on
+        the alignment path, and more dangerous here because the scan is looking for exactly that
+        shape. */
+        let card = vec![0xABCD_1234u64; 40];
+        let a: Vec<u64> = moving_seq(40).iter().copied().chain(card.clone()).collect();
+        let b: Vec<u64> = moving_seq(40)
+            .iter()
+            .map(|h| !h)
+            .chain(card.iter().copied())
+            .collect();
+
+        let ungated = best_matching_run(&a, &b, &run_params(10)).expect("finds the card");
+        assert_eq!(
+            ungated.run_avg_bits, 0.0,
+            "ungated, the shared card is perfect"
+        );
+
+        let gated = best_matching_run(
+            &a,
+            &b,
+            &DedupParams {
+                motion_bits: 2,
+                ..run_params(10)
+            },
+        );
+        let far = gated.is_none_or(|r| r.run_avg_bits > 10.0);
+        assert!(far, "gated, the card cannot carry the run: {gated:?}");
     }
 
     #[test]
