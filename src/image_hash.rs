@@ -235,17 +235,27 @@ impl ImageHash {
 /// sharing any chunk with the query hash. Callers must still verify each
 /// returned candidate with [`ImageHash::hamming`] — the index is a superset
 /// filter, not a verdict.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HammingIndex {
     tables: Vec<HashMap<u16, Vec<usize>>>,
+}
+
+/* Written out rather than derived. A derived `Default` leaves `tables` empty, and both `add` and
+`query` iterate it — so a defaulted index accepts every entry, stores none of them, and answers
+every query with nothing, reporting no error at any point. An empty index is a legitimate starting
+state for incremental use, so it has to mean the same thing as `build(&[])`. */
+impl Default for HammingIndex {
+    fn default() -> Self {
+        HammingIndex {
+            tables: vec![HashMap::new(); NUM_CHUNKS],
+        }
+    }
 }
 
 impl HammingIndex {
     /// Build an index over `hashes`, keyed by their position in the slice.
     pub fn build(hashes: &[ImageHash]) -> Self {
-        let mut index = HammingIndex {
-            tables: vec![HashMap::new(); NUM_CHUNKS],
-        };
+        let mut index = HammingIndex::default();
         for (idx, h) in hashes.iter().enumerate() {
             index.add(idx, h);
         }
@@ -390,6 +400,21 @@ mod tests {
             .unwrap();
         let h = ImageHash::from_image_bytes(&bytes).unwrap();
         assert_eq!(h.to_hex(), "0".repeat(HASH_BYTES * 2));
+    }
+
+    #[test]
+    fn a_defaulted_index_behaves_like_an_empty_built_one() {
+        // The derived Default left `tables` empty, and both add and query iterate
+        // it — so a defaulted index swallowed every entry and answered every
+        // query with nothing, with no error to say so.
+        let h = ImageHash::from_hex(&"ab".repeat(HASH_BYTES)).unwrap();
+        let mut defaulted = HammingIndex::default();
+        defaulted.add(0, &h);
+        assert_eq!(defaulted.query(&h, None), HashSet::from([0]));
+
+        let mut built = HammingIndex::build(&[]);
+        built.add(0, &h);
+        assert_eq!(built.query(&h, None), defaulted.query(&h, None));
     }
 
     #[test]
