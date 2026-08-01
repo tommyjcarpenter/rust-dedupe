@@ -192,6 +192,17 @@ sub-fingerprints, and is usually the one worth building: a frame hash cannot see
 reframe, so on re-encoded content no two frames are near-identical and a visual index surfaces
 nothing, while audio reads near-zero on shared content and does land in the same bands.
 
+`query` unions buckets, which is the right call for a short query. Over a long one it stops
+selecting: with a few hundred elements across several bands, a chance collision against any given
+candidate is all but certain, so almost the whole corpus comes back. `query_votes` checks the
+actual distance and counts how many distinct query elements have a near match, which restores
+selectivity — near-identity is rare where collision is not. Within 3 bits of a 32-bit hash lie
+5489 of 2^32 values, so an accidental vote runs about 1.3e-6 per element pair while genuinely
+shared content votes once per shared element.
+
+Keep `max_bits` under the pigeonhole limit (`bands - 1`) or recall breaks: a pair farther apart
+than that need not share a band, so it is never in a bucket to be checked at all.
+
 ## Partial overlap
 
 `best_alignment` answers "are these the same clip": it averages over the whole

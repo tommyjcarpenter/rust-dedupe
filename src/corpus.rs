@@ -51,11 +51,13 @@ mod sealed {
 /// A fixed-width hash the index can split into bands. Implemented for `u64` (frame hashes) and
 /// `u32` (audio sub-fingerprints); sealed, because the band arithmetic assumes the width is
 /// exactly `BITS` and a third implementation would need the assertions revisited.
-pub trait BandedHash: sealed::Sealed + Copy {
+pub trait BandedHash: sealed::Sealed + Copy + Eq + Hash {
     /// Width of the hash in bits. Bands must divide it.
     const BITS: usize;
     /// The `i`th band of `width` bits, low-order band first.
     fn band(self, i: usize, width: u32) -> u16;
+    /// Hamming distance to another hash of the same width.
+    fn hamming(self, other: Self) -> u32;
 }
 
 impl BandedHash for u64 {
@@ -65,6 +67,10 @@ impl BandedHash for u64 {
         let mask: u64 = (1u64 << width) - 1;
         ((self >> (i as u32 * width)) & mask) as u16
     }
+    #[inline]
+    fn hamming(self, other: Self) -> u32 {
+        (self ^ other).count_ones()
+    }
 }
 
 impl BandedHash for u32 {
@@ -73,6 +79,10 @@ impl BandedHash for u32 {
     fn band(self, i: usize, width: u32) -> u16 {
         let mask: u32 = (1u32 << width) - 1;
         ((self >> (i as u32 * width)) & mask) as u16
+    }
+    #[inline]
+    fn hamming(self, other: Self) -> u32 {
+        (self ^ other).count_ones()
     }
 }
 
@@ -107,7 +117,7 @@ impl BandedHash for u32 {
 /// ```
 #[derive(Debug, Clone)]
 pub struct FrameCorpusIndex<Id, H: BandedHash = u64> {
-    tables: Vec<HashMap<u16, Vec<Id>>>,
+    tables: Vec<HashMap<u16, Vec<(Id, H)>>>,
     band_width: u32,
     /// `fn() -> H` rather than `H`: the index owns no hashes, it only reads their bands.
     hash: std::marker::PhantomData<fn() -> H>,
@@ -163,12 +173,17 @@ impl<Id: Copy + Eq + Hash, H: BandedHash> FrameCorpusIndex<Id, H> {
     /// (it can then appear more than once in a bucket, though [`query`](Self::query)
     /// still returns it once) — rebuild the index to replace an item.
     pub fn add(&mut self, id: Id, frames: impl IntoIterator<Item = H>) {
-        let mut seen: HashSet<(usize, u16)> = HashSet::new();
+        let mut seen: HashSet<(usize, u16, H)> = HashSet::new();
         for f in frames {
             for (i, table) in self.tables.iter_mut().enumerate() {
                 let v = f.band(i, self.band_width);
-                if seen.insert((i, v)) {
-                    table.entry(v).or_default().push(id);
+                /* Deduped on the HASH as well as the bucket, not just the bucket. Keeping one
+                representative per bucket would be enough to answer "does anything collide", but
+                `query_votes` measures distance against what is stored, so a distinct hash that
+                happened to share a bucket with an earlier one has to survive or it can never be
+                voted for. Exact repeats — a static run, a silent stretch — still collapse. */
+                if seen.insert((i, v, f)) {
+                    table.entry(v).or_default().push((id, f));
                 }
             }
         }
@@ -185,11 +200,79 @@ impl<Id: Copy + Eq + Hash, H: BandedHash> FrameCorpusIndex<Id, H> {
                 if scanned.insert((i, v))
                     && let Some(bucket) = table.get(&v)
                 {
-                    out.extend(bucket.iter().copied());
+                    out.extend(bucket.iter().map(|(id, _)| *id));
                 }
             }
         }
         out
+    }
+
+    /// Votes per candidate: how many DISTINCT query elements have a match within `max_bits` of
+    /// one of that candidate's. The number to threshold on when a bucket collision alone is not
+    /// evidence.
+    ///
+    /// [`query`](Self::query) returns everything sharing any band with any query element. Over a
+    /// long query that is nearly the whole corpus: with a few hundred elements across several
+    /// bands, chance collisions against any given candidate are all but certain, so the union
+    /// selects nothing. Checking the distance is what restores selectivity — near-identity is
+    /// rare where collision is not. Within 3 bits of a 32-bit hash lie 5489 of 2^32 values
+    /// (`C(32,0) + C(32,1) + C(32,2) + C(32,3)`), so a chance vote runs about 1.3e-6 per element
+    /// pair, while genuinely shared content votes once per shared element.
+    ///
+    /// `max_bits` must be under the pigeonhole limit (`bands - 1`) or the guarantee is lost and
+    /// near matches can be missed: a value farther apart than that need not share any band, so it
+    /// is never in a bucket to be checked. Distinct elements, not raw collisions — one query
+    /// element colliding on several bands is one vote, so the count is comparable across
+    /// candidates however the bands fell.
+    pub fn query_votes(
+        &self,
+        frames: impl IntoIterator<Item = H>,
+        max_bits: u32,
+    ) -> HashMap<Id, usize> {
+        /* Past the pigeonhole limit the answer is quietly wrong rather than absent: a pair
+        farther apart than `bands - 1` need not share a band, so it is never in a bucket to be
+        checked and simply does not vote. Debug-only, since the bound is a caller's constant. */
+        debug_assert!(
+            (max_bits as usize) < self.tables.len(),
+            "max_bits {max_bits} is past the pigeonhole limit for {} bands; matches that far              apart need not share a band and would be missed silently",
+            self.tables.len(),
+        );
+        let mut votes: HashMap<Id, usize> = HashMap::new();
+        // Distinctness is only needed WITHIN one query element, so this is cleared per element
+        // rather than accumulating a (element, id) entry for the whole query. It also lets an id
+        // that already voted skip the distance check on its remaining bands.
+        let mut voted: HashSet<Id> = HashSet::new();
+        for f in frames {
+            voted.clear();
+            for (i, table) in self.tables.iter().enumerate() {
+                let v = f.band(i, self.band_width);
+                let Some(bucket) = table.get(&v) else {
+                    continue;
+                };
+                for (id, stored) in bucket {
+                    if !voted.contains(id) && f.hamming(*stored) <= max_bits {
+                        voted.insert(*id);
+                        *votes.entry(*id).or_default() += 1;
+                    }
+                }
+            }
+        }
+        votes
+    }
+
+    /// Candidates with at least `min_votes` elements matching within `max_bits`. See
+    /// [`query_votes`](Self::query_votes) for what a vote is and how to choose `max_bits`.
+    pub fn query_verified(
+        &self,
+        frames: impl IntoIterator<Item = H>,
+        max_bits: u32,
+        min_votes: usize,
+    ) -> HashSet<Id> {
+        self.query_votes(frames, max_bits)
+            .into_iter()
+            .filter(|&(_, n)| n >= min_votes)
+            .map(|(id, _)| id)
+            .collect()
     }
 }
 
@@ -200,6 +283,99 @@ mod tests {
     /* Audio sub-fingerprints are 32-bit, so the band arithmetic has to key off the hash width
     rather than a baked-in 64. At 4 bands each is 8 bits wide, and the pigeonhole guarantee is
     the same shape: two values within `bands - 1` bits must agree on some band. */
+    /* A deterministic pseudo-random sub-fingerprint stream. Real chromaprint output is
+    high-entropy, which is the property the selectivity argument rests on. */
+    fn fps(seed: u32, n: usize) -> Vec<u32> {
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x
+            })
+            .collect()
+    }
+
+    /* The whole reason `query_votes` exists. A bare bucket union over a few hundred query
+    elements returns essentially the entire corpus — chance collisions are certain at that
+    length — so it selects nothing and the expensive verification behind it runs on everything.
+    Requiring near-identity instead cuts it to the item that actually shares content. */
+    #[test]
+    fn voting_selects_where_a_bucket_union_does_not() {
+        let shared = fps(0xABCD, 60);
+        let mut ix: AudioCorpusIndex<u8> = AudioCorpusIndex::with_bands(4);
+        for id in 0..40u8 {
+            ix.add(id, fps(id as u32 * 7919 + 11, 400));
+        }
+        // One item genuinely carries the shared run; everything else is unrelated.
+        ix.add(
+            99u8,
+            fps(0x5150, 340)
+                .into_iter()
+                .chain(shared.clone())
+                .collect::<Vec<_>>(),
+        );
+        let query: Vec<u32> = shared.iter().copied().chain(fps(0x2222, 340)).collect();
+
+        let union = ix.query(query.iter().copied());
+        assert!(
+            union.len() > 20,
+            "a bare union is not selective over a long query: {} of 41",
+            union.len()
+        );
+
+        let voted = ix.query_verified(query.iter().copied(), 3, 10);
+        assert_eq!(
+            voted.into_iter().collect::<Vec<_>>(),
+            vec![99u8],
+            "verification leaves only the item that shares content"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "past the pigeonhole limit")]
+    fn asking_past_the_pigeonhole_limit_is_caught_in_debug() {
+        /* The one failure here that produces no error of its own: matches farther apart than
+        `bands - 1` need not share a band, so they are never in a bucket to check and simply do
+        not vote. Caught loudly in debug rather than returning a quietly short answer. */
+        let ix: AudioCorpusIndex<u8> = AudioCorpusIndex::with_bands(4);
+        let _ = ix.query_votes([1u32, 2, 3], 4);
+    }
+
+    #[test]
+    fn every_shared_element_votes() {
+        // A run of N shared elements should produce ~N votes, so a threshold well under the
+        // overlap floor is safe rather than a guess.
+        let shared = fps(0x1234, 50);
+        let mut ix: AudioCorpusIndex<u8> = AudioCorpusIndex::with_bands(4);
+        ix.add(1u8, shared.clone());
+        let votes = ix.query_votes(shared.iter().copied(), 3);
+        assert_eq!(votes.get(&1u8), Some(&50));
+    }
+
+    #[test]
+    fn a_near_match_inside_the_pigeonhole_limit_still_votes() {
+        /* Recall is the property that matters most: a missed overlap fails silently. At 4 bands
+        anything within 3 bits must share a band, so it is always in a bucket to be checked. */
+        let base = fps(0x777, 40);
+        let mut ix: AudioCorpusIndex<u8> = AudioCorpusIndex::with_bands(4);
+        ix.add(1u8, base.clone());
+        let nudged: Vec<u32> = base.iter().map(|h| h ^ 0b101).collect();
+        assert_eq!(ix.query_votes(nudged, 3).get(&1u8), Some(&40));
+    }
+
+    #[test]
+    fn distance_bounds_the_vote() {
+        let base = fps(0x999, 30);
+        let mut ix: AudioCorpusIndex<u8> = AudioCorpusIndex::with_bands(4);
+        ix.add(1u8, base.clone());
+        // Three flipped bits is inside the bound; asking for two excludes them.
+        let nudged: Vec<u32> = base.iter().map(|h| h ^ 0b111).collect();
+        assert_eq!(ix.query_votes(nudged.clone(), 3).get(&1u8), Some(&30));
+        assert_eq!(ix.query_votes(nudged, 2).get(&1u8), None);
+    }
+
     #[test]
     fn an_audio_index_round_trips_a_u32_fingerprint() {
         let mut ix: AudioCorpusIndex<&str> = AudioCorpusIndex::with_bands(4);
