@@ -181,6 +181,27 @@ The one thing that is *not* tunable is the pixel-side sampling geometry
 constants define the exact bits of the stored hash, so they are fixed: hashes
 computed by any version of the crate stay comparable.
 
+## Partial overlap
+
+`best_alignment` answers "are these the same clip": it averages over the whole
+intersection, so two clips that share a scene and then diverge have the shared
+part averaged with the part that isn't, and a real overlap disappears into the
+mean. No threshold recovers it — the number measures the wrong span.
+
+`best_matching_run`, and `best_matching_audio_run` for the audio side, answer
+"do these share footage, and which part". At each offset they find the best
+window holding exactly `min_overlap` scored elements, and return it alongside
+the whole-overlap mean at that same offset. A low `run_avg_bits` beside a high
+`full_avg_bits` is precisely a partial overlap. Cost is the same
+`O(len_a * len_b)` sweep as the plain alignment.
+
+Three cautions. The scan always returns its best window, so the DISTANCE is
+what rejects a pair, never the absence of a result — a caller treating `Some`
+as a match would flag everything. Keep the motion gate on, because a shared
+black card is exactly the shape the scan hunts for. And do not feed run matches
+into union-find clustering: connected-component collapse chains unrelated clips
+together through a shared intro.
+
 ## Development
 
 ```sh

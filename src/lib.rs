@@ -68,11 +68,12 @@ pub mod extract;
 
 // Re-export the primary entry points at the crate root for ergonomics.
 pub use align::{
-    Alignment, DupeEdge, OverlapKind, PairScore, best_alignment, find_candidates, score_visual,
-    score_visual_segments,
+    Alignment, DupeEdge, OverlapKind, PairScore, RunMatch, best_alignment, best_matching_run,
+    find_candidates, score_visual, score_visual_segments,
 };
 pub use audio::{
-    AudioDupeEdge, best_audio_alignment, find_audio_candidates, hamming32, score_audio,
+    AudioDupeEdge, best_audio_alignment, best_matching_audio_run, find_audio_candidates, hamming32,
+    score_audio,
 };
 pub use cluster::cluster_edges;
 pub use config::DedupParams;

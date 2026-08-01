@@ -111,6 +111,27 @@ fn hamming32_dist(a: &u32, b: &u32) -> u32 {
     hamming32(*a, *b)
 }
 
+/// The audio analogue of [`crate::align::best_matching_run`]: the best-matching stretch of
+/// sub-fingerprints, for two clips that share a scene rather than being the same clip.
+///
+/// Usually the more useful of the two. A frame hash cannot see through a reframe, so on
+/// re-encoded content the visual run scan has nothing to find; audio survives that and reads
+/// near-zero on shared content, so it is what actually locates the shared span.
+pub fn best_matching_audio_run(
+    a: &[u32],
+    b: &[u32],
+    params: &DedupParams,
+) -> Option<crate::align::RunMatch> {
+    crate::align::best_run_generic(
+        a,
+        b,
+        params.audio_min_overlap,
+        params.audio_min_overlap_hard_floor,
+        params.audio_motion_bits,
+        hamming32_dist,
+    )
+}
+
 /// Score a single pair of sub-fingerprint sequences. `(avg_bits, overlap)`, or
 /// `None` when either side is below the audio hard floor or no shift meets the
 /// adaptive floor. Mirrors [`crate::align::score_visual`]'s floor logic on the
