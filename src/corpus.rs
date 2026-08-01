@@ -215,9 +215,9 @@ impl<Id: Copy + Eq + Hash, H: BandedHash> FrameCorpusIndex<Id, H> {
     /// long query that is nearly the whole corpus: with a few hundred elements across several
     /// bands, chance collisions against any given candidate are all but certain, so the union
     /// selects nothing. Checking the distance is what restores selectivity — near-identity is
-    /// rare where collision is not. Within 3 bits of a 32-bit hash lie ~5457 of 2^32 values, so a
-    /// chance vote runs about 1.3e-6 per element pair, while genuinely shared content votes once
-    /// per shared element.
+    /// rare where collision is not. Within 3 bits of a 32-bit hash lie 5489 of 2^32 values
+    /// (`C(32,0) + C(32,1) + C(32,2) + C(32,3)`), so a chance vote runs about 1.3e-6 per element
+    /// pair, while genuinely shared content votes once per shared element.
     ///
     /// `max_bits` must be under the pigeonhole limit (`bands - 1`) or the guarantee is lost and
     /// near matches can be missed: a value farther apart than that need not share any band, so it
@@ -229,16 +229,29 @@ impl<Id: Copy + Eq + Hash, H: BandedHash> FrameCorpusIndex<Id, H> {
         frames: impl IntoIterator<Item = H>,
         max_bits: u32,
     ) -> HashMap<Id, usize> {
+        /* Past the pigeonhole limit the answer is quietly wrong rather than absent: a pair
+        farther apart than `bands - 1` need not share a band, so it is never in a bucket to be
+        checked and simply does not vote. Debug-only, since the bound is a caller's constant. */
+        debug_assert!(
+            (max_bits as usize) < self.tables.len(),
+            "max_bits {max_bits} is past the pigeonhole limit for {} bands; matches that far              apart need not share a band and would be missed silently",
+            self.tables.len(),
+        );
         let mut votes: HashMap<Id, usize> = HashMap::new();
-        let mut voted: HashSet<(usize, Id)> = HashSet::new();
-        for (qi, f) in frames.into_iter().enumerate() {
+        // Distinctness is only needed WITHIN one query element, so this is cleared per element
+        // rather than accumulating a (element, id) entry for the whole query. It also lets an id
+        // that already voted skip the distance check on its remaining bands.
+        let mut voted: HashSet<Id> = HashSet::new();
+        for f in frames {
+            voted.clear();
             for (i, table) in self.tables.iter().enumerate() {
                 let v = f.band(i, self.band_width);
                 let Some(bucket) = table.get(&v) else {
                     continue;
                 };
                 for (id, stored) in bucket {
-                    if f.hamming(*stored) <= max_bits && voted.insert((qi, *id)) {
+                    if !voted.contains(id) && f.hamming(*stored) <= max_bits {
+                        voted.insert(*id);
                         *votes.entry(*id).or_default() += 1;
                     }
                 }
@@ -318,6 +331,16 @@ mod tests {
             vec![99u8],
             "verification leaves only the item that shares content"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "past the pigeonhole limit")]
+    fn asking_past_the_pigeonhole_limit_is_caught_in_debug() {
+        /* The one failure here that produces no error of its own: matches farther apart than
+        `bands - 1` need not share a band, so they are never in a bucket to check and simply do
+        not vote. Caught loudly in debug rather than returning a quietly short answer. */
+        let ix: AudioCorpusIndex<u8> = AudioCorpusIndex::with_bands(4);
+        let _ = ix.query_votes([1u32, 2, 3], 4);
     }
 
     #[test]
