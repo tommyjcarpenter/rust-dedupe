@@ -30,11 +30,16 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-/// Default band count for [`FrameCorpusIndex::new`]. Eight 8-bit bands favour
-/// recall — two frames within 7 bits of Hamming distance still share a band — so
-/// same-content-different-encode duplicates (frames uniformly a few bits off) are
-/// still caught. Use [`FrameCorpusIndex::with_bands`] to trade recall for
-/// selectivity on a very large corpus (see that method).
+/// Default band count for [`FrameCorpusIndex::new`]. Eight bands favour recall: two hashes
+/// within 7 bits of Hamming distance still share one, so same-content-different-encode
+/// duplicates (uniformly a few bits off) are still caught.
+///
+/// The guarantee is `bands - 1` bits whatever the hash width, so it holds equally for `u64`
+/// frames and `u32` sub-fingerprints — only the band WIDTH differs, 8 bits on the former and 4
+/// on the latter. Narrower bands mean larger buckets, so the same count is somewhat less
+/// selective on the shorter hash.
+///
+/// Use [`FrameCorpusIndex::with_bands`] to trade recall for selectivity on a large corpus.
 pub const DEFAULT_BANDS: usize = 8;
 
 mod sealed {
