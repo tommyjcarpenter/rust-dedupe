@@ -181,6 +181,17 @@ The one thing that is *not* tunable is the pixel-side sampling geometry
 constants define the exact bits of the stored hash, so they are fixed: hashes
 computed by any version of the crate stay comparable.
 
+## Candidate indexes
+
+`FrameCorpusIndex` answers "which items in a large corpus could match this one" without
+rescanning per query — a pigeonhole band index, so two hashes within `bands - 1` bits are
+guaranteed to share a band. It is a prefilter only: verify every candidate with a real score.
+
+It is generic over the hash width. `AudioCorpusIndex` is the same index over `u32` audio
+sub-fingerprints, and is usually the one worth building: a frame hash cannot see through a
+reframe, so on re-encoded content no two frames are near-identical and a visual index surfaces
+nothing, while audio reads near-zero on shared content and does land in the same bands.
+
 ## Partial overlap
 
 `best_alignment` answers "are these the same clip": it averages over the whole
