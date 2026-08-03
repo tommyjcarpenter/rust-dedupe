@@ -199,6 +199,40 @@ pub struct RunMatch {
     pub full_avg_bits: f32,
 }
 
+/// How much two sequences actually share, walked out from a [`RunMatch`] seed.
+///
+/// A [`RunMatch`] is the best window holding exactly `run_scored` elements, so it answers "is
+/// there a match here" — which is what a verdict needs, and all it needs. It cannot answer "how
+/// much is shared": every overlap reports one window, so two sequences sharing two minutes and two
+/// sharing nine seconds come back the same length, and the reported start sits wherever the match
+/// was easiest to prove rather than where the content began matching.
+///
+/// Produced by [`shared_span`] / [`shared_audio_span`], which take a seed and the sequences it
+/// came from. Separate from the scan because it is a separate question: a caller deciding only
+/// whether a pair is a duplicate never needs it and should not pay for the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SharedSpan {
+    /// Where the shared stretch begins in `a`, at or before the seed's `run_start_a`.
+    pub start_a: usize,
+    /// Where the shared stretch begins in `b`, at or before the seed's `run_start_b`.
+    pub start_b: usize,
+    /// Elements the stretch spans, at or above the seed's `run_len`.
+    pub len: usize,
+}
+
+impl SharedSpan {
+    /// One past the last element of the stretch in `a`.
+    pub fn end_a(&self) -> usize {
+        self.start_a + self.len
+    }
+
+    /// One past the last element of the stretch in `b`.
+    pub fn end_b(&self) -> usize {
+        self.start_b + self.len
+    }
+}
+
 /* The best-matching run at one offset: `(start, span, avg)`, or `None` when the window never
 holds `w` scored elements. Two pointers over the overlap maintaining a window with exactly `w` of
 them, so the whole sweep stays O(len_a * len_b) — the same cost as the alignment it sits beside.
@@ -244,6 +278,98 @@ fn best_run_at<T>(
         }
     }
     best
+}
+
+/* Consecutive failing elements the walk tolerates before it calls the content diverged.
+
+One bad element is not a boundary: a compression artifact, a dropped frame, a transient in the
+audio. Requiring a clean break of more than this many in a row stops the walk at a real divergence
+rather than at noise. The frontier is the last element that MATCHED, so tolerated misses that never
+recover extend nothing — they only buy the walk a chance to continue. */
+const MAX_CONSECUTIVE_MISSES: usize = 2;
+
+/* The per-element bar for "this is still the same content", from the seed's own quality.
+
+Absolute bars do not transfer: a pristine copy runs a couple of bits apart and a re-encode ten, so
+a bar tight enough for the first cuts the second short and a bar loose enough for the second walks
+the first into unrelated footage. Two unrelated elements sit around `width/2` — half the bits
+differ by chance — so the midpoint between the seed's average and that baseline separates the two
+cases without a tuned constant: still closer to the run than to chance. */
+fn extend_tolerance(run_avg_bits: f32, width_bits: u32) -> u32 {
+    let chance = width_bits as f32 / 2.0;
+    if !run_avg_bits.is_finite() || run_avg_bits >= chance {
+        return 0;
+    }
+    ((run_avg_bits + chance) / 2.0) as u32
+}
+
+/* How far the shared stretch really reaches, walking out from the seed along the fixed shift.
+
+The seed is the best window of exactly `w` scored elements, so it says where a match was easiest to
+prove, not where the footage started matching. Both clips advance together — the shift is fixed
+inside a shared stretch — so this is a linear walk from the seed's edges, bounded by whichever
+sequence ends first. Cost is the length of what it finds, against the O(len_a * len_b) scan that
+found the seed.
+
+Gated elements (a static run, digital silence) carry no signal, so they are stepped over without
+counting as a match or a miss. They cannot run the walk away: the frontier only advances on an
+element that matched, so coasting through a silence and then finding nothing leaves the frontier
+where it was. Coasting through a silence and then finding MORE matching content is the correct
+answer — content that matches on both sides of a silence at one shift is one stretch. */
+fn extend_run<T>(
+    a: &[T],
+    b: &[T],
+    masks: Option<&(Vec<bool>, Vec<bool>)>,
+    seed: (usize, usize, usize),
+    tolerance: u32,
+    dist: impl Fn(&T, &T) -> u32,
+) -> (usize, usize, usize) {
+    let (seed_a, seed_b, seed_len) = seed;
+    let scored_at = |ia: usize, ib: usize| masks.is_none_or(|(ma, mb)| ma[ia] || mb[ib]);
+    let holds = |ia: usize, ib: usize| dist(&a[ia], &b[ib]) <= tolerance;
+
+    let (mut start_a, mut start_b) = (seed_a, seed_b);
+    let (mut ia, mut ib) = (seed_a, seed_b);
+    let mut misses = 0usize;
+    while ia > 0 && ib > 0 {
+        ia -= 1;
+        ib -= 1;
+        if !scored_at(ia, ib) {
+            continue;
+        }
+        if holds(ia, ib) {
+            start_a = ia;
+            start_b = ib;
+            misses = 0;
+        } else {
+            misses += 1;
+            if misses > MAX_CONSECUTIVE_MISSES {
+                break;
+            }
+        }
+    }
+
+    // Exclusive, in a's index space; b tracks it at the same shift.
+    let mut end_a = seed_a + seed_len;
+    let (mut ia, mut ib) = (seed_a + seed_len, seed_b + seed_len);
+    let mut misses = 0usize;
+    while ia < a.len() && ib < b.len() {
+        if scored_at(ia, ib) {
+            if holds(ia, ib) {
+                end_a = ia + 1;
+                misses = 0;
+            } else {
+                misses += 1;
+                if misses > MAX_CONSECUTIVE_MISSES {
+                    break;
+                }
+            }
+        }
+        ia += 1;
+        ib += 1;
+    }
+
+    (start_a, start_b, end_a - start_a)
 }
 
 /* Shared core of the run scan. Same offset range and floors as `best_alignment`, but scoring the
@@ -311,6 +437,52 @@ pub(crate) fn best_run_generic<T>(
         });
     }
     best
+}
+
+/* Shared core of the outward walk. Rebuilds the motion masks the scan already built once, which
+is O(len) against the O(len_a * len_b) sweep that produced the seed — the price of keeping this a
+separate call, and small enough that it buys the caller the choice of not walking at all. */
+pub(crate) fn shared_span_generic<T>(
+    a: &[T],
+    b: &[T],
+    run: &RunMatch,
+    motion_bits: u32,
+    width_bits: u32,
+    dist: impl Fn(&T, &T) -> u32 + Copy,
+) -> SharedSpan {
+    let seed = (run.run_start_a, run.run_start_b, run.run_len);
+    if run.run_start_a + run.run_len > a.len() || run.run_start_b + run.run_len > b.len() {
+        // A seed from different sequences than the ones handed in. Report it unchanged rather
+        // than indexing out of bounds on a caller's mix-up.
+        return SharedSpan {
+            start_a: run.run_start_a,
+            start_b: run.run_start_b,
+            len: run.run_len,
+        };
+    }
+    let masks = masks_for(a, b, motion_bits, dist);
+    let (start_a, start_b, len) = extend_run(
+        a,
+        b,
+        masks.as_ref(),
+        seed,
+        extend_tolerance(run.run_avg_bits, width_bits),
+        dist,
+    );
+    SharedSpan {
+        start_a,
+        start_b,
+        len,
+    }
+}
+
+/// How much of two frame-hash sequences is really shared, walking out from a [`RunMatch`] seed
+/// until the content diverges. See [`SharedSpan`].
+///
+/// `run` must be the result of [`best_matching_run`] on these same two sequences, and `params` the
+/// same ones — the walk reads the seed's own average to decide what still counts as matching.
+pub fn shared_span(a: &[u64], b: &[u64], run: &RunMatch, params: &DedupParams) -> SharedSpan {
+    shared_span_generic(a, b, run, params.motion_bits, u64::BITS, hamming64_dist)
 }
 
 /// The best-matching run between two frame-hash sequences, for finding a shared stretch inside
@@ -825,6 +997,182 @@ mod tests {
         );
         let far = gated.is_none_or(|r| r.run_avg_bits > 10.0);
         assert!(far, "gated, the card cannot carry the run: {gated:?}");
+    }
+
+    /* A shared stretch of `shared` elements sitting `lead_a` / `lead_b` into two otherwise
+    unrelated sequences. The leads differ so the shift is non-zero and the walk has to move both
+    sides together to stay on the content. */
+    fn shared_stretch(
+        lead_a: usize,
+        lead_b: usize,
+        shared: usize,
+        tail: usize,
+    ) -> (Vec<u64>, Vec<u64>) {
+        let common = moving_seq(shared as u64);
+        let mut a: Vec<u64> = moving_seq(lead_a as u64).iter().map(|x| !x).collect();
+        a.extend(common.iter().copied());
+        a.extend(
+            moving_seq(tail as u64)
+                .iter()
+                .map(|x| x ^ 0x5555_5555_5555_5555),
+        );
+        let mut b: Vec<u64> = moving_seq(lead_b as u64)
+            .iter()
+            .map(|x| x ^ 0x0F0F)
+            .collect();
+        b.extend(common.iter().copied());
+        b.extend(
+            moving_seq(tail as u64)
+                .iter()
+                .map(|x| x ^ 0xAAAA_AAAA_AAAA_AAAA),
+        );
+        (a, b)
+    }
+
+    /* The same shared stretch, but only its middle third is a pristine copy — the outer thirds
+    carry a few flipped bits, as a re-encode does. That is what puts the seed strictly INSIDE the
+    stretch: the window with the lowest average is the clean middle, so the reported start is late
+    and the reported end early, exactly the real-footage behavior. A perfectly-matching stretch
+    ties at zero everywhere and the first window wins, which would hide a missing backward walk. */
+    fn shared_stretch_clean_middle(
+        lead_a: usize,
+        lead_b: usize,
+        shared: usize,
+        tail: usize,
+    ) -> (Vec<u64>, Vec<u64>) {
+        let (a, mut b) = shared_stretch(lead_a, lead_b, shared, tail);
+        let third = shared / 3;
+        for k in 0..shared {
+            if k < third || k >= shared - third {
+                b[lead_b + k] ^= 0b111;
+            }
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn the_walk_recovers_the_whole_shared_stretch_not_the_seed() {
+        /* The seed is the best window holding exactly `min_overlap` elements, so on a stretch far
+        longer than the window it lands somewhere inside and says nothing about the extent. What is
+        wanted is where the footage starts and stops matching. */
+        let (a, b) = shared_stretch_clean_middle(40, 12, 90, 30);
+        let r = best_matching_run(&a, &b, &run_params(10)).expect("a 90-element stretch matches");
+        assert_eq!(r.run_scored, 10, "the seed is one window");
+        assert!(
+            r.run_start_a > 40 && r.run_start_a + r.run_len < 130,
+            "the seed must sit strictly inside the stretch or this proves nothing: {r:?}"
+        );
+        let span = shared_span(&a, &b, &r, &run_params(10));
+        assert_eq!(
+            (span.start_a, span.start_b, span.len),
+            (40, 12, 90),
+            "the walk recovers the real edges on both sides"
+        );
+        assert_eq!((span.end_a(), span.end_b()), (130, 102));
+    }
+
+    #[test]
+    fn the_walk_stops_where_the_content_diverges() {
+        // Everything outside the stretch is unrelated, so neither edge may leak into it. The seed
+        // starts inside, so both walks travel before they have to stop at the right place.
+        let (a, b) = shared_stretch_clean_middle(25, 25, 40, 25);
+        let r = best_matching_run(&a, &b, &run_params(10)).expect("a 40-element stretch matches");
+        let span = shared_span(&a, &b, &r, &run_params(10));
+        assert_eq!(span.start_a, 25, "did not walk back into unrelated lead");
+        assert_eq!(span.len, 40, "did not walk forward into unrelated tail");
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_sequence_edge() {
+        // A stretch running to the very head of both clips: the walk has to end at 0, not underflow.
+        let (a, b) = shared_stretch(0, 0, 50, 20);
+        let r = best_matching_run(&a, &b, &run_params(10)).expect("matches");
+        let span = shared_span(&a, &b, &r, &run_params(10));
+        assert_eq!((span.start_a, span.start_b), (0, 0));
+        assert_eq!(span.len, 50);
+    }
+
+    #[test]
+    fn one_damaged_element_does_not_end_the_stretch() {
+        /* A single bad element is noise, not a boundary — a compression artifact or a dropped
+        frame. Requiring a clean break of several in a row is what keeps the walk from stopping on
+        it, and the reported extent has to span the damage. */
+        let (a, mut b) = shared_stretch(20, 20, 60, 20);
+        b[20 + 45] = !b[20 + 45];
+        let r = best_matching_run(&a, &b, &run_params(10)).expect("matches");
+        let span = shared_span(&a, &b, &r, &run_params(10));
+        assert_eq!(span.start_a, 20);
+        assert_eq!(span.len, 60, "walked straight past the damaged element");
+    }
+
+    #[test]
+    fn the_extent_is_never_shorter_than_the_seed() {
+        /* The invariant every consumer leans on: the seed is a stretch that matched, so the walk
+        can only ever agree with it or find more. Checked on a stretch barely longer than the
+        window, where there is almost nothing to extend into. */
+        let (a, b) = shared_stretch(15, 8, 12, 15);
+        let r = best_matching_run(&a, &b, &run_params(10)).expect("matches");
+        let span = shared_span(&a, &b, &r, &run_params(10));
+        assert!(span.len >= r.run_len, "{span:?} vs {r:?}");
+        assert!(span.start_a <= r.run_start_a, "{span:?} vs {r:?}");
+        assert!(span.start_b <= r.run_start_b, "{span:?} vs {r:?}");
+    }
+
+    #[test]
+    fn the_walk_steps_over_a_gated_run_to_reach_content_beyond_it() {
+        /* A static run carries no signal, so it neither extends the stretch nor ends it. Content
+        matching on both sides of one at the same offset is one stretch, and reporting two would
+        make the caller cut a clip in the middle of footage it shares. */
+        let common = moving_seq(30);
+        let card = [0xABCD_1234u64; 25];
+        let build = |lead: u64, salt: u64| {
+            let mut v: Vec<u64> = moving_seq(lead).iter().map(|x| x ^ salt).collect();
+            v.extend(common.iter().copied());
+            v.extend(card.iter().copied());
+            v.extend(common.iter().map(|x| x ^ 0x00FF));
+            v
+        };
+        let a = build(10, 0xF0F0_0000_0000_0000);
+        let b = build(10, 0x0F0F_0000_0000_0000);
+        let params = DedupParams {
+            motion_bits: 2,
+            ..run_params(10)
+        };
+        let r = best_matching_run(&a, &b, &params).expect("the moving content matches");
+        let span = shared_span(&a, &b, &r, &params);
+        assert!(
+            span.len >= 30 + 25 + 30,
+            "the stretch has to span the static run, got {span:?}"
+        );
+    }
+
+    #[test]
+    fn a_seed_from_other_sequences_is_reported_unchanged() {
+        // A caller mixing up which sequences a seed came from gets the seed back, not a panic.
+        let (a, b) = shared_stretch(10, 10, 40, 10);
+        let r = best_matching_run(&a, &b, &run_params(10)).expect("matches");
+        let span = shared_span(&a[..12], &b[..12], &r, &run_params(10));
+        assert_eq!(
+            (span.start_a, span.start_b, span.len),
+            (r.run_start_a, r.run_start_b, r.run_len)
+        );
+    }
+
+    #[test]
+    fn the_tolerance_sits_between_the_seed_and_chance() {
+        /* Derived from the seed rather than fixed, so a pristine copy and a re-encode each get a
+        bar suited to their own noise floor. Both stay well under chance, which is half the width. */
+        assert_eq!(extend_tolerance(0.0, 64), 16, "pristine: half of chance");
+        assert_eq!(
+            extend_tolerance(8.0, 64),
+            20,
+            "a noisy re-encode gets more room"
+        );
+        assert_eq!(extend_tolerance(0.0, 32), 8, "narrower hashes scale down");
+        assert_eq!(extend_tolerance(2.0, 32), 9);
+        // A seed no better than chance is not a match; nothing should extend from it.
+        assert_eq!(extend_tolerance(16.0, 32), 0);
+        assert_eq!(extend_tolerance(f32::NAN, 64), 0);
     }
 
     #[test]
