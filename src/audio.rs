@@ -132,6 +132,28 @@ pub fn best_matching_audio_run(
     )
 }
 
+/// How much of two sub-fingerprint sequences is really shared, walking out from a
+/// [`crate::align::RunMatch`] seed until the content diverges. The audio analogue of
+/// [`crate::align::shared_span`]; see [`crate::align::SharedSpan`].
+///
+/// `run` must be the result of [`best_matching_audio_run`] on these same two sequences, and
+/// `params` the same ones.
+pub fn shared_audio_span(
+    a: &[u32],
+    b: &[u32],
+    run: &crate::align::RunMatch,
+    params: &DedupParams,
+) -> crate::align::SharedSpan {
+    crate::align::shared_span_generic(
+        a,
+        b,
+        run,
+        params.audio_motion_bits,
+        u32::BITS,
+        hamming32_dist,
+    )
+}
+
 /// Score a single pair of sub-fingerprint sequences. `(avg_bits, overlap)`, or
 /// `None` when either side is below the audio hard floor or no shift meets the
 /// adaptive floor. Mirrors [`crate::align::score_visual`]'s floor logic on the
