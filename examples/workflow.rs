@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use perceptual_dedupe::image_hash::GRAY_LEN;
 use perceptual_dedupe::{
-    DedupParams, ImageHash, OverlapKind, best_alignment, cluster_edges, dhash_9x8, find_candidates,
+    DedupParams, ImageHash, OverlapKind, align_visual, cluster_edges, dhash_9x8, find_candidates,
     find_duplicates,
 };
 
@@ -110,12 +110,7 @@ fn main() {
     // ----- Step 4: subset vs superset for one pair ---------------------------
     // The alignment also tells you *how* two clips overlap, so a caller can
     // keep the longer copy.
-    let al = best_alignment(
-        &original,
-        &clips["trimmed"],
-        params.min_overlap_frames,
-        params.motion_bits,
-    );
+    let al = align_visual(&original, &clips["trimmed"], &params).expect("the trimmed copy aligns");
     let kind = al.classify(original.len(), clips["trimmed"].len());
     println!(
         "\n'original' vs 'trimmed': shift {}, overlap {} -> {:?}",
