@@ -164,6 +164,14 @@ every overlapping frame. `audio_motion_bits` is the same gate on the audio
 signal, off by default; silence fingerprints to a constant run, so without it
 two silent stretches align at ~0 bits and match anything.
 
+The overlap floors count elements the gate scores, not raw length.
+`min_overlap_frames` adapts down to what each clip can score, never below
+`min_overlap_hard_floor`, so a short or mostly static clip still matches a copy
+across all of its moving frames, and a clip that cannot score the hard floor is
+refused outright. `moving_frames` and `moving_sub_fingerprints` report that
+count, for a consumer that computes its own floor before calling
+`best_alignment`.
+
 `audio_alone_bits` is off by default and opts into a third verdict tier, in
 which audio admits a pair on its own. A frame hash cannot see through a
 reframe — a de-pillarboxed crop and a smaller copy of the same clip read ~20

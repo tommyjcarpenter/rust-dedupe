@@ -136,6 +136,48 @@ pub(crate) fn moving_mask<T>(
         .collect()
 }
 
+fn count_moving(mask: &[bool]) -> usize {
+    mask.iter().filter(|&&moving| moving).count()
+}
+
+/* How many elements of `seq` the gate scores: every one when the gate is off, else those that move
+against a neighbour (see `moving_mask`). No alignment of `seq` can score more, so the overlap floors
+are measured against this rather than the raw length. */
+pub(crate) fn moving_count_generic<T>(
+    seq: &[T],
+    motion_bits: u32,
+    dist: impl Fn(&T, &T) -> u32,
+) -> usize {
+    if motion_bits == 0 {
+        return seq.len();
+    }
+    count_moving(&moving_mask(seq, motion_bits, dist))
+}
+
+/// How many frames of a hash sequence the motion gate scores, which is the most any alignment of
+/// it can score. The overlap floors in [`score_visual`], [`find_candidates`] and
+/// [`best_matching_run`] adapt to this count; a consumer that computes a floor itself before
+/// calling [`best_alignment`] can do the same.
+pub fn moving_frames(seq: &[u64], motion_bits: u32) -> usize {
+    moving_count_generic(seq, motion_bits, hamming64_dist)
+}
+
+/* The per-pair overlap floor: `target` raised to at least `hard_floor`, then capped at what each
+side can score, so a short or mostly static clip still matches a copy across all of its moving
+elements. `None` when either side cannot score even `hard_floor` elements: below that the sliding
+search finds false positives reliably enough that no distance threshold rescues precision. */
+pub(crate) fn effective_floor(
+    target: usize,
+    hard_floor: usize,
+    scorable_a: usize,
+    scorable_b: usize,
+) -> Option<usize> {
+    if scorable_a < hard_floor || scorable_b < hard_floor {
+        return None;
+    }
+    Some(target.max(hard_floor).min(scorable_a).min(scorable_b))
+}
+
 /// Hamming distance between two 64-bit frame hashes.
 pub(crate) fn hamming64_dist(a: &u64, b: &u64) -> u32 {
     (a ^ b).count_ones()
@@ -382,19 +424,19 @@ pub(crate) fn best_run_generic<T>(
     motion_bits: u32,
     dist: impl Fn(&T, &T) -> u32 + Copy,
 ) -> Option<RunMatch> {
-    if a.len() < hard_floor || b.len() < hard_floor {
-        return None;
-    }
-    let w = min_overlap.max(hard_floor).min(a.len()).min(b.len()).max(1);
     if a.is_empty() || b.is_empty() || a.len() > i32::MAX as usize || b.len() > i32::MAX as usize {
         return None;
     }
+    let masks = masks_for(a, b, motion_bits, dist);
+    let (scorable_a, scorable_b) = masks.as_ref().map_or((a.len(), b.len()), |(ma, mb)| {
+        (count_moving(ma), count_moving(mb))
+    });
+    let w = effective_floor(min_overlap, hard_floor, scorable_a, scorable_b)?.max(1);
     let max_pos: i32 = a.len() as i32 - w as i32;
     let max_neg: i32 = w as i32 - b.len() as i32;
     if max_pos < max_neg {
         return None;
     }
-    let masks = masks_for(a, b, motion_bits, dist);
     let mut best: Option<RunMatch> = None;
     for shift in max_neg..=max_pos {
         let (a_start, b_start) = if shift >= 0 {
@@ -612,22 +654,22 @@ pub struct PairScore {
     pub visual_seg_b: usize,
 }
 
-/// Score a single pair of hash sequences. `None` when either side is below the
-/// hard overlap floor, or no shift meets the adaptive floor.
+/// Score a single pair of hash sequences. `None` when either side cannot score
+/// the hard overlap floor, or no shift meets the adaptive floor.
 ///
 /// The effective floor is `min_overlap_frames` raised to at least
-/// `min_overlap_hard_floor`, then capped at each sequence's length so short
-/// clips can still match across their full length (but never below the hard
-/// floor).
+/// `min_overlap_hard_floor`, then capped at the frames each sequence can score
+/// under the motion gate (see [`moving_frames`]), so a short or mostly static
+/// clip still matches a copy across all of its moving frames (but never below
+/// the hard floor). Measured against raw length instead, a 60-frame clip with
+/// one frozen frame could never reach a 60-frame floor, even against itself.
 pub fn score_visual(a: &[u64], b: &[u64], params: &DedupParams) -> Option<PairScore> {
-    if a.len() < params.min_overlap_hard_floor || b.len() < params.min_overlap_hard_floor {
-        return None;
-    }
-    let effective_min = params
-        .min_overlap_frames
-        .max(params.min_overlap_hard_floor)
-        .min(a.len())
-        .min(b.len());
+    let effective_min = effective_floor(
+        params.min_overlap_frames,
+        params.min_overlap_hard_floor,
+        moving_frames(a, params.motion_bits),
+        moving_frames(b, params.motion_bits),
+    )?;
     let alignment = best_alignment(a, b, effective_min, params.motion_bits);
     if alignment.overlap < effective_min {
         return None;
@@ -742,6 +784,11 @@ where
     // reproducible rather than dependent on HashMap iteration order.
     let mut entries: Vec<(Id, &[u64])> = hashes.iter().map(|(k, v)| (*k, v.as_ref())).collect();
     entries.sort_unstable_by_key(|(id, _)| *id);
+    // Counted once per entry: the floor of every pair the entry is in reads it.
+    let scorable: Vec<usize> = entries
+        .iter()
+        .map(|(_, h)| moving_frames(h, params.motion_bits))
+        .collect();
     let mut out = Vec::new();
     for i in 0..entries.len() {
         for j in (i + 1)..entries.len() {
@@ -755,15 +802,14 @@ where
             if excluded.contains(&pair) {
                 continue;
             }
-            if ha.len() < params.min_overlap_hard_floor || hb.len() < params.min_overlap_hard_floor
-            {
+            let Some(effective_min) = effective_floor(
+                params.min_overlap_frames,
+                params.min_overlap_hard_floor,
+                scorable[i],
+                scorable[j],
+            ) else {
                 continue;
-            }
-            let effective_min = params
-                .min_overlap_frames
-                .max(params.min_overlap_hard_floor)
-                .min(ha.len())
-                .min(hb.len());
+            };
             let alignment = best_alignment(ha, hb, effective_min, params.motion_bits);
             if alignment.overlap < effective_min || alignment.avg_bits > params.threshold_bits {
                 continue;
@@ -790,6 +836,96 @@ mod tests {
         (0..n)
             .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
             .collect()
+    }
+
+    /* A clip whose head moves and whose tail repeats the head's last frame, so the gate scores
+    exactly `moving` of its frames. */
+    fn static_tailed(moving: u64, frozen: usize) -> Vec<u64> {
+        let mut clip = moving_seq(moving);
+        let last = *clip.last().expect("a non-empty head");
+        clip.extend(std::iter::repeat_n(last, frozen));
+        clip
+    }
+
+    fn floor_params(target: usize, hard_floor: usize) -> DedupParams {
+        DedupParams {
+            min_overlap_frames: target,
+            min_overlap_hard_floor: hard_floor,
+            motion_bits: 2,
+            ..DedupParams::default()
+        }
+    }
+
+    #[test]
+    fn moving_frames_counts_what_the_gate_scores() {
+        let clip = static_tailed(40, 20);
+        assert_eq!(moving_frames(&clip, 2), 40);
+        assert_eq!(moving_frames(&clip, 0), 60, "gate off: every frame");
+        assert_eq!(moving_frames(&[], 2), 0);
+        assert_eq!(
+            moving_frames(&[7u64; 30], 2),
+            0,
+            "a frozen clip scores nothing"
+        );
+    }
+
+    #[test]
+    fn a_mostly_static_clip_matches_its_copy_across_its_moving_frames() {
+        /* 60 frames of which 40 move. Against a 60-frame target the raw-length floor was the whole
+        clip, and 40 scored frames could never reach it, so the clip failed to match even itself.
+        The floor now caps at what the gate can score. */
+        let clip = static_tailed(40, 20);
+        let score = score_visual(&clip, &clip, &floor_params(60, 30)).expect("a copy matches");
+        assert_eq!(score.visual_avg, 0.0);
+        assert_eq!(score.visual_overlap, 40);
+    }
+
+    #[test]
+    fn the_floor_follows_the_side_with_fewer_scorable_frames() {
+        // The same moving head with frozen tails of different lengths: 35 scorable frames each.
+        let a = static_tailed(35, 25);
+        let b = static_tailed(35, 10);
+        let score = score_visual(&a, &b, &floor_params(60, 30)).expect("a copy matches");
+        assert_eq!(score.visual_avg, 0.0);
+        assert_eq!(score.visual_overlap, 35);
+    }
+
+    #[test]
+    fn a_clip_that_cannot_score_the_hard_floor_is_refused() {
+        let clip = static_tailed(20, 40);
+        assert!(score_visual(&clip, &clip, &floor_params(60, 30)).is_none());
+    }
+
+    #[test]
+    fn the_adapted_floor_does_not_admit_unrelated_static_clips() {
+        let a = static_tailed(40, 20);
+        let b: Vec<u64> = moving_seq(80)[40..]
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(1u64, 20))
+            .collect();
+        let p = floor_params(60, 30);
+        let score = score_visual(&a, &b, &p).expect("the floor is reachable; the distance decides");
+        assert!(score.visual_avg > p.threshold_bits);
+    }
+
+    #[test]
+    fn find_candidates_pairs_a_static_clip_with_its_copy() {
+        let clip = static_tailed(40, 20);
+        let hashes: HashMap<u32, Vec<u64>> = HashMap::from([(1, clip.clone()), (2, clip)]);
+        let ranks: HashMap<u32, u64> = HashMap::from([(1, 1), (2, 2)]);
+        let edges = find_candidates(&hashes, &ranks, &HashSet::new(), &floor_params(60, 30));
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].avg_bits, 0.0);
+        assert_eq!(edges[0].overlap_frames, 40);
+    }
+
+    #[test]
+    fn a_run_is_found_in_a_static_clip_and_its_copy() {
+        let clip = static_tailed(40, 20);
+        let run = best_matching_run(&clip, &clip, &floor_params(60, 30)).expect("a run exists");
+        assert_eq!(run.run_scored, 40);
+        assert_eq!(run.run_avg_bits, 0.0);
     }
 
     #[test]
