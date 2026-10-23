@@ -19,9 +19,23 @@
 //! (including a lone single-frame sequence), which reproduces the plain
 //! average-over-all-overlapping-frames behavior. The two regimes are otherwise
 //! the same code path.
+//!
+//! # The overlap floors
+//!
+//! A pair is held to two bars. The window an alignment covers must span the
+//! target number of raw elements, capped at the shorter sequence and never
+//! under the hard floor; a sequence shorter than the hard floor is refused.
+//! Inside that window, the elements the gate scores must reach the hard floor.
+//! A position scores when either side moves there, so a frozen clip beside a
+//! moving copy scores every position, a mostly static clip and its copy score
+//! only their moving frames, and two clips that share only a frozen picture
+//! score nothing. [`align_visual`] and [`best_matching_run`] apply the floors
+//! of a [`DedupParams`]; [`best_alignment`] holds both bars at the one number
+//! its caller passes.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::ops::RangeInclusive;
 
 use crate::config::DedupParams;
 
@@ -136,6 +150,119 @@ pub(crate) fn moving_mask<T>(
         .collect()
 }
 
+/* The overlap floors one pair is held to.
+
+`span` is in raw elements: an alignment's window must be at least this long, which also bounds the
+shifts tried. `target` and `hard` are in scored elements, applied to each window through `window`.
+Both are at least 1, so no average is ever taken over nothing (0/0 -> NaN). */
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Floors {
+    span: usize,
+    target: usize,
+    hard: usize,
+}
+
+impl Floors {
+    fn new(span: usize, target: usize, hard: usize) -> Floors {
+        Floors {
+            span: span.max(1),
+            target,
+            hard: hard.max(1),
+        }
+    }
+
+    /* One number for every bar: the floor the caller of `best_alignment` or `best_audio_alignment`
+    states itself. */
+    pub(crate) fn flat(min_overlap: usize) -> Floors {
+        Floors::new(min_overlap, min_overlap, min_overlap)
+    }
+
+    /* The floors `DedupParams` describe, for two sequences of these lengths. The target spans at
+    most the shorter sequence, so a short clip can match across its whole length, but never less
+    than the hard floor. `None` when a sequence is shorter than the hard floor: below it the sliding
+    search finds false positives reliably enough that no distance threshold rescues precision. */
+    pub(crate) fn for_pair(
+        target: usize,
+        hard: usize,
+        len_a: usize,
+        len_b: usize,
+    ) -> Option<Floors> {
+        let shorter = len_a.min(len_b);
+        if shorter < hard {
+            return None;
+        }
+        Some(Floors::new(target.max(hard).min(shorter), target, hard))
+    }
+
+    /* What one window must score: the target, lowered to what the window scores, never under the
+    hard floor. `None` when the window scores fewer elements than the hard floor.
+
+    This is measured on the window, not on either sequence. The gate scores a position when either
+    side moves there, so a frozen clip beside a moving copy of itself scores every position, and a
+    sequence's own moving count bounds nothing. Lowering the target to the window's count is what
+    lets a mostly static clip match a copy across its moving frames: the frozen frames carry no
+    evidence either way, and the hard floor still demands enough moving ones. */
+    fn window(&self, scored: usize) -> Option<usize> {
+        if scored < self.hard {
+            return None;
+        }
+        Some(self.target.max(self.hard).min(scored))
+    }
+}
+
+fn visual_floors(params: &DedupParams, len_a: usize, len_b: usize) -> Option<Floors> {
+    Floors::for_pair(
+        params.min_overlap_frames,
+        params.min_overlap_hard_floor,
+        len_a,
+        len_b,
+    )
+}
+
+/* Every shift at which the sequences overlap by at least `span` elements: positive shifts trim the
+front of `a`, negative ones the front of `b`. `None` when a sequence is shorter than `span`, and for
+a length or span beyond i32::MAX, which the shift arithmetic would truncate into bogus bounds and
+bad slice indices; such inputs (billions of frames) are pathological, so they are no match rather
+than a misbehaviour. */
+fn shifts_spanning(len_a: usize, len_b: usize, span: usize) -> Option<RangeInclusive<i32>> {
+    let fits = |n: usize| i32::try_from(n).ok();
+    let (len_a, len_b, span) = (fits(len_a)?, fits(len_b)?, fits(span)?);
+    if len_a < span || len_b < span {
+        return None;
+    }
+    Some(span - len_b..=len_a - span)
+}
+
+/* The stretch two sequences overlap on at one shift, with the mask slices that score it. */
+struct Window<'s, T> {
+    a_start: usize,
+    b_start: usize,
+    a: &'s [T],
+    b: &'s [T],
+    masks: Option<(&'s [bool], &'s [bool])>,
+}
+
+fn window_at<'s, T>(
+    a: &'s [T],
+    b: &'s [T],
+    masks: Option<&'s (Vec<bool>, Vec<bool>)>,
+    shift: i32,
+) -> Window<'s, T> {
+    let (a_start, b_start) = if shift >= 0 {
+        (shift as usize, 0)
+    } else {
+        (0, (-shift) as usize)
+    };
+    let len = (a.len() - a_start).min(b.len() - b_start);
+    Window {
+        a_start,
+        b_start,
+        a: &a[a_start..a_start + len],
+        b: &b[b_start..b_start + len],
+        masks: masks.map(|(ma, mb)| (&ma[a_start..a_start + len], &mb[b_start..b_start + len])),
+    }
+}
+
 /// Hamming distance between two 64-bit frame hashes.
 pub(crate) fn hamming64_dist(a: &u64, b: &u64) -> u32 {
     (a ^ b).count_ones()
@@ -185,8 +312,9 @@ pub struct RunMatch {
     /// Elements the run spans. Larger than `run_scored` when the motion gate skipped
     /// something inside it.
     pub run_len: usize,
-    /// Elements actually scored in the run — always the effective overlap floor, since the run
-    /// is defined as the best window holding exactly that many.
+    /// Elements actually scored in the run: the target floor, lowered to what this shift's window
+    /// scored when the window held less, never under the hard floor. The run is defined as the
+    /// best window holding exactly this many.
     pub run_scored: usize,
     /// Average distance over the run's scored elements: whether this stretch is shared content.
     pub run_avg_bits: f32,
@@ -372,68 +500,39 @@ fn extend_run<T>(
     (start_a, start_b, end_a - start_a)
 }
 
-/* Shared core of the run scan. Same offset range and floors as `best_alignment`, but scoring the
-best window at each offset instead of the whole overlap. */
+/* Shared core of the run scan. Same shifts and floors as `best_alignment_generic`, but scoring the
+best window at each shift instead of the whole overlap. */
 pub(crate) fn best_run_generic<T>(
     a: &[T],
     b: &[T],
-    min_overlap: usize,
-    hard_floor: usize,
+    floors: Floors,
     motion_bits: u32,
     dist: impl Fn(&T, &T) -> u32 + Copy,
 ) -> Option<RunMatch> {
-    if a.len() < hard_floor || b.len() < hard_floor {
-        return None;
-    }
-    let w = min_overlap.max(hard_floor).min(a.len()).min(b.len()).max(1);
-    if a.is_empty() || b.is_empty() || a.len() > i32::MAX as usize || b.len() > i32::MAX as usize {
-        return None;
-    }
-    let max_pos: i32 = a.len() as i32 - w as i32;
-    let max_neg: i32 = w as i32 - b.len() as i32;
-    if max_pos < max_neg {
-        return None;
-    }
+    let shifts = shifts_spanning(a.len(), b.len(), floors.span)?;
     let masks = masks_for(a, b, motion_bits, dist);
     let mut best: Option<RunMatch> = None;
-    for shift in max_neg..=max_pos {
-        let (a_start, b_start) = if shift >= 0 {
-            (shift as usize, 0)
-        } else {
-            (0, (-shift) as usize)
-        };
-        let overlap = (a.len() - a_start).min(b.len() - b_start);
-        if overlap < w {
+    for shift in shifts {
+        let win = window_at(a, b, masks.as_ref(), shift);
+        let (scored, total) = score_window(win.a, win.b, win.masks, dist);
+        let Some(w) = floors.window(scored) else {
             continue;
-        }
-        let a_win = &a[a_start..a_start + overlap];
-        let b_win = &b[b_start..b_start + overlap];
-        let win_masks = masks.as_ref().map(|(ma, mb)| {
-            (
-                &ma[a_start..a_start + overlap],
-                &mb[b_start..b_start + overlap],
-            )
-        });
-        let Some((run_off, run_len, run_avg)) = best_run_at(a_win, b_win, win_masks, w, &dist)
+        };
+        let Some((run_off, run_len, run_avg)) = best_run_at(win.a, win.b, win.masks, w, &dist)
         else {
             continue;
         };
         if best.is_some_and(|prev| run_avg >= prev.run_avg_bits) {
             continue;
         }
-        let (scored, total) = score_window(a_win, b_win, win_masks, dist);
         best = Some(RunMatch {
             shift,
-            run_start_a: a_start + run_off,
-            run_start_b: b_start + run_off,
+            run_start_a: win.a_start + run_off,
+            run_start_b: win.b_start + run_off,
             run_len,
             run_scored: w,
             run_avg_bits: run_avg,
-            full_avg_bits: if scored == 0 {
-                f32::MAX
-            } else {
-                (total as f64 / scored as f64) as f32
-            },
+            full_avg_bits: (total as f64 / scored as f64) as f32,
         });
     }
     best
@@ -488,17 +587,11 @@ pub fn shared_span(a: &[u64], b: &[u64], run: &RunMatch, params: &DedupParams) -
 /// The best-matching run between two frame-hash sequences, for finding a shared stretch inside
 /// clips that are not the same clip end to end. See [`RunMatch`].
 ///
-/// Uses the same floors and motion gate as [`score_visual`], so a run is held to the same
+/// Uses the same floors and motion gate as [`align_visual`], so a run is held to the same
 /// evidence bar as an alignment; only the span it averages over differs.
 pub fn best_matching_run(a: &[u64], b: &[u64], params: &DedupParams) -> Option<RunMatch> {
-    best_run_generic(
-        a,
-        b,
-        params.min_overlap_frames,
-        params.min_overlap_hard_floor,
-        params.motion_bits,
-        hamming64_dist,
-    )
+    let floors = visual_floors(params, a.len(), b.len())?;
+    best_run_generic(a, b, floors, params.motion_bits, hamming64_dist)
 }
 
 /// Both sequences' moving masks, or `None` when the gate is off. Built once per pair.
@@ -516,13 +609,47 @@ pub(crate) fn masks_for<T>(
     })
 }
 
+/* Shared core of the alignment search: slide `b` along `a` and keep the shift with the lowest
+average distance per scored element among the windows that clear `floors`. */
+pub(crate) fn best_alignment_generic<T>(
+    a: &[T],
+    b: &[T],
+    floors: Floors,
+    motion_bits: u32,
+    dist: impl Fn(&T, &T) -> u32 + Copy,
+) -> Alignment {
+    let Some(shifts) = shifts_spanning(a.len(), b.len(), floors.span) else {
+        return Alignment::NO_MATCH;
+    };
+    let masks = masks_for(a, b, motion_bits, dist);
+    let mut best = Alignment::NO_MATCH;
+    for shift in shifts {
+        let win = window_at(a, b, masks.as_ref(), shift);
+        let (scored, total_bits) = score_window(win.a, win.b, win.masks, dist);
+        // A window's floor is at most what it scored, so only the hard floor can refuse it here.
+        if floors.window(scored).is_none() {
+            continue;
+        }
+        let avg = (total_bits as f64 / scored as f64) as f32;
+        if avg < best.avg_bits {
+            best = Alignment {
+                shift,
+                avg_bits: avg,
+                overlap: scored,
+            };
+        }
+    }
+    best
+}
+
 /// Find the best alignment of `b` against `a` by sliding `b`'s hash sequence
 /// and minimizing the average Hamming distance per scored frame.
 ///
 /// Only frames where either side is moving (per `motion_bits`) are scored and
 /// counted toward the overlap. Only alignments whose moving overlap is at
 /// least `min_overlap` are considered. If none qualifies, returns
-/// [`Alignment::NO_MATCH`].
+/// [`Alignment::NO_MATCH`]. [`align_visual`] applies the two floors of a
+/// [`DedupParams`] instead, under which a mostly static clip can match.
 ///
 /// The minimum `avg_bits` is order-independent: `best_alignment(a, b, ..)` and
 /// `best_alignment(b, a, ..)` return the same `avg_bits`, because the moving
@@ -530,64 +657,24 @@ pub(crate) fn masks_for<T>(
 /// guaranteed to mirror, though — when several shifts tie on the minimum
 /// average, the first-wins tie-break can pick different ones in each direction.
 pub fn best_alignment(a: &[u64], b: &[u64], min_overlap: usize, motion_bits: u32) -> Alignment {
-    // An alignment needs at least one overlapping frame; treat 0 as 1 so the
-    // average is never computed over an empty (0/0 -> NaN) overlap.
-    let min_overlap = min_overlap.max(1);
-    if a.is_empty() || b.is_empty() {
-        return Alignment::NO_MATCH;
-    }
-    // The shift arithmetic below casts lengths to i32; sequences or an overlap
-    // floor beyond i32::MAX would truncate into bogus bounds (and bad slice
-    // indices). Such inputs are pathological (billions of frames), so treat
-    // them as no match rather than misbehaving.
-    if a.len() > i32::MAX as usize || b.len() > i32::MAX as usize || min_overlap > i32::MAX as usize
-    {
-        return Alignment::NO_MATCH;
-    }
-    /* Valid shift range, derived from the overlap constraint:
-       positive shift: a_start = shift   -> overlap = min(a.len()-shift, b.len())
-       negative shift: b_start = -shift   -> overlap = min(a.len(), b.len()+shift)
-    The floor here is on raw overlap; the stricter moving-frame floor is applied
-    per shift below. */
-    let max_pos: i32 = a.len() as i32 - min_overlap as i32;
-    let max_neg: i32 = min_overlap as i32 - b.len() as i32;
-    if max_pos < max_neg {
-        return Alignment::NO_MATCH;
-    }
-    let masks = masks_for(a, b, motion_bits, hamming64_dist);
-    let mut best = Alignment::NO_MATCH;
-    for shift in max_neg..=max_pos {
-        let (a_start, b_start) = if shift >= 0 {
-            (shift as usize, 0)
-        } else {
-            (0, (-shift) as usize)
-        };
-        let overlap = (a.len() - a_start).min(b.len() - b_start);
-        if overlap < min_overlap {
-            continue;
-        }
-        let a_win = &a[a_start..a_start + overlap];
-        let b_win = &b[b_start..b_start + overlap];
-        let win_masks = masks.as_ref().map(|(ma, mb)| {
-            (
-                &ma[a_start..a_start + overlap],
-                &mb[b_start..b_start + overlap],
-            )
-        });
-        let (moving_overlap, total_bits) = score_window(a_win, b_win, win_masks, hamming64_dist);
-        if moving_overlap < min_overlap {
-            continue;
-        }
-        let avg = (total_bits as f64 / moving_overlap as f64) as f32;
-        if avg < best.avg_bits {
-            best = Alignment {
-                shift,
-                avg_bits: avg,
-                overlap: moving_overlap,
-            };
-        }
-    }
-    best
+    best_alignment_generic(a, b, Floors::flat(min_overlap), motion_bits, hamming64_dist)
+}
+
+/// [`best_alignment`] under the floors of `params`. The window must span
+/// `min_overlap_frames` frames, capped at the shorter clip and never under
+/// `min_overlap_hard_floor`, and must hold at least `min_overlap_hard_floor`
+/// frames the motion gate scores. `None` when a clip is shorter than the hard
+/// floor or no shift clears both bars.
+///
+/// Holding the scored frames to the hard floor rather than to the target is
+/// what lets a mostly static clip match: its frozen frames carry no evidence
+/// either way, so a 60-frame clip with 40 moving ones matches its copy across
+/// those 40. Held to a raw-length target instead, it could never match even
+/// itself.
+pub fn align_visual(a: &[u64], b: &[u64], params: &DedupParams) -> Option<Alignment> {
+    let floors = visual_floors(params, a.len(), b.len())?;
+    let alignment = best_alignment_generic(a, b, floors, params.motion_bits, hamming64_dist);
+    alignment.matched().then_some(alignment)
 }
 
 /// Per-pair near-duplicate measurement. The visual alignment, plus a lazily
@@ -612,26 +699,10 @@ pub struct PairScore {
     pub visual_seg_b: usize,
 }
 
-/// Score a single pair of hash sequences. `None` when either side is below the
-/// hard overlap floor, or no shift meets the adaptive floor.
-///
-/// The effective floor is `min_overlap_frames` raised to at least
-/// `min_overlap_hard_floor`, then capped at each sequence's length so short
-/// clips can still match across their full length (but never below the hard
-/// floor).
+/// Score a single pair of hash sequences: [`align_visual`] as a [`PairScore`],
+/// `None` when no alignment clears the floors.
 pub fn score_visual(a: &[u64], b: &[u64], params: &DedupParams) -> Option<PairScore> {
-    if a.len() < params.min_overlap_hard_floor || b.len() < params.min_overlap_hard_floor {
-        return None;
-    }
-    let effective_min = params
-        .min_overlap_frames
-        .max(params.min_overlap_hard_floor)
-        .min(a.len())
-        .min(b.len());
-    let alignment = best_alignment(a, b, effective_min, params.motion_bits);
-    if alignment.overlap < effective_min {
-        return None;
-    }
+    let alignment = align_visual(a, b, params)?;
     Some(PairScore {
         visual_avg: alignment.avg_bits,
         visual_overlap: alignment.overlap,
@@ -755,17 +826,10 @@ where
             if excluded.contains(&pair) {
                 continue;
             }
-            if ha.len() < params.min_overlap_hard_floor || hb.len() < params.min_overlap_hard_floor
-            {
+            let Some(alignment) = align_visual(ha, hb, params) else {
                 continue;
-            }
-            let effective_min = params
-                .min_overlap_frames
-                .max(params.min_overlap_hard_floor)
-                .min(ha.len())
-                .min(hb.len());
-            let alignment = best_alignment(ha, hb, effective_min, params.motion_bits);
-            if alignment.overlap < effective_min || alignment.avg_bits > params.threshold_bits {
+            };
+            if alignment.avg_bits > params.threshold_bits {
                 continue;
             }
             let (canonical, member) = orient(id_a, id_b, ranks);
@@ -790,6 +854,168 @@ mod tests {
         (0..n)
             .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
             .collect()
+    }
+
+    /* A clip whose head moves and whose tail repeats the head's last frame, so the gate scores
+    exactly `moving` of its frames. */
+    fn static_tailed(moving: u64, frozen: usize) -> Vec<u64> {
+        let mut clip = moving_seq(moving);
+        let last = *clip.last().expect("a non-empty head");
+        clip.extend(std::iter::repeat_n(last, frozen));
+        clip
+    }
+
+    fn floor_params(target: usize, hard_floor: usize) -> DedupParams {
+        DedupParams {
+            min_overlap_frames: target,
+            min_overlap_hard_floor: hard_floor,
+            motion_bits: 2,
+            ..DedupParams::default()
+        }
+    }
+
+    #[test]
+    fn the_window_floor_is_the_target_lowered_to_what_the_window_scores() {
+        let floors = Floors::for_pair(60, 30, 100, 100).expect("long enough");
+        assert_eq!(
+            floors.window(80),
+            Some(60),
+            "the target when the window holds it"
+        );
+        assert_eq!(
+            floors.window(45),
+            Some(45),
+            "lowered to what the window scores"
+        );
+        assert_eq!(floors.window(30), Some(30), "down to the hard floor");
+        assert_eq!(floors.window(29), None, "refused under it");
+    }
+
+    #[test]
+    fn the_span_is_the_target_capped_at_the_shorter_sequence() {
+        assert_eq!(Floors::for_pair(60, 30, 100, 45).map(|f| f.span), Some(45));
+        assert_eq!(
+            Floors::for_pair(10, 30, 100, 100).map(|f| f.span),
+            Some(30),
+            "never under the hard floor"
+        );
+        assert_eq!(
+            Floors::for_pair(60, 30, 100, 29),
+            None,
+            "a sequence under the hard floor is refused"
+        );
+    }
+
+    #[test]
+    fn a_zero_hard_floor_still_demands_one_scored_element() {
+        let floors = Floors::for_pair(60, 0, 60, 60).expect("long enough");
+        assert_eq!(floors.window(0), None);
+        assert_eq!(floors.window(1), Some(1));
+        assert_eq!(
+            Floors::flat(0).span,
+            1,
+            "an alignment needs one overlapping element"
+        );
+    }
+
+    #[test]
+    fn a_mostly_static_clip_matches_its_copy_across_its_moving_frames() {
+        /* 60 frames of which 40 move. Against a 60-frame target the raw-length floor was the whole
+        clip, and 40 scored frames could never reach it, so the clip failed to match even itself.
+        The scored frames are held to the hard floor; the target is on the span. */
+        let clip = static_tailed(40, 20);
+        let score = score_visual(&clip, &clip, &floor_params(60, 30)).expect("a copy matches");
+        assert_eq!(score.visual_avg, 0.0);
+        assert_eq!(score.visual_overlap, 40);
+    }
+
+    #[test]
+    fn copies_with_different_frozen_tails_match_across_the_shared_motion() {
+        // The same moving head with frozen tails of different lengths.
+        let a = static_tailed(35, 25);
+        let b = static_tailed(35, 10);
+        let score = score_visual(&a, &b, &floor_params(60, 30)).expect("a copy matches");
+        assert_eq!(score.visual_avg, 0.0);
+        assert_eq!(score.visual_overlap, 35);
+    }
+
+    #[test]
+    fn a_frozen_clip_beside_a_moving_copy_scores_every_frame() {
+        /* The gate scores a position when either side moves there. `a` flickers by one bit, under
+        the gate, so on its own it moves nowhere; `b` flickers by two bits at the same positions and
+        moves everywhere. Every position scores, half a bit apart on average, and a's own moving
+        count of zero refuses nothing. */
+        let a: Vec<u64> = [0u64, 1].iter().copied().cycle().take(60).collect();
+        let b: Vec<u64> = [0u64, 3].iter().copied().cycle().take(60).collect();
+        let p = floor_params(60, 30);
+        let score = score_visual(&a, &b, &p).expect("every position scores");
+        assert_eq!((score.visual_avg, score.visual_overlap), (0.5, 60));
+        let run = best_matching_run(&a, &b, &p).expect("the run spans the clip");
+        assert_eq!((run.run_avg_bits, run.run_scored), (0.5, 60));
+    }
+
+    #[test]
+    fn a_static_excerpt_is_found_inside_the_longer_clip() {
+        /* A 60-frame clip of which 35 move, cut from the middle of a 120-frame clip whose lead and
+        tail are unrelated. The longer clip moves far more than the excerpt, but at the true shift
+        the window scores the excerpt's moving frames, and that is what the floor is lowered to. */
+        let excerpt = static_tailed(35, 25);
+        let unrelated = |n: u64| moving_seq(n).iter().map(|h| !h).collect::<Vec<u64>>();
+        let long = [unrelated(30), excerpt.clone(), unrelated(30)].concat();
+        let al = align_visual(&excerpt, &long, &floor_params(60, 30)).expect("the excerpt aligns");
+        assert_eq!((al.avg_bits, al.shift), (0.0, -30));
+        assert_eq!(
+            al.classify(excerpt.len(), long.len()),
+            OverlapKind::ContainedBy
+        );
+    }
+
+    #[test]
+    fn a_clip_that_cannot_score_the_hard_floor_is_refused() {
+        let clip = static_tailed(20, 40);
+        assert!(score_visual(&clip, &clip, &floor_params(60, 30)).is_none());
+    }
+
+    #[test]
+    fn a_zero_hard_floor_does_not_turn_no_match_into_a_score() {
+        /* Two frozen clips score nothing. A hard floor of 0 must still demand one scored element,
+        or the no-match sentinel would come back as a score of f32::MAX over nothing. */
+        let frozen = vec![7u64; 60];
+        let p = floor_params(60, 0);
+        assert!(score_visual(&frozen, &frozen, &p).is_none());
+        assert!(best_matching_run(&frozen, &frozen, &p).is_none());
+    }
+
+    #[test]
+    fn the_lowered_floor_does_not_admit_unrelated_static_clips() {
+        let a = static_tailed(40, 20);
+        let b: Vec<u64> = moving_seq(80)[40..]
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(1u64, 20))
+            .collect();
+        let p = floor_params(60, 30);
+        let score = score_visual(&a, &b, &p).expect("the floor is reachable; the distance decides");
+        assert!(score.visual_avg > p.threshold_bits);
+    }
+
+    #[test]
+    fn find_candidates_pairs_a_static_clip_with_its_copy() {
+        let clip = static_tailed(40, 20);
+        let hashes: HashMap<u32, Vec<u64>> = HashMap::from([(1, clip.clone()), (2, clip)]);
+        let ranks: HashMap<u32, u64> = HashMap::from([(1, 1), (2, 2)]);
+        let edges = find_candidates(&hashes, &ranks, &HashSet::new(), &floor_params(60, 30));
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].avg_bits, 0.0);
+        assert_eq!(edges[0].overlap_frames, 40);
+    }
+
+    #[test]
+    fn a_run_is_found_in_a_static_clip_and_its_copy() {
+        let clip = static_tailed(40, 20);
+        let run = best_matching_run(&clip, &clip, &floor_params(60, 30)).expect("a run exists");
+        assert_eq!(run.run_scored, 40);
+        assert_eq!(run.run_avg_bits, 0.0);
     }
 
     #[test]

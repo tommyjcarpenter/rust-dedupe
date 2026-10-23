@@ -7,10 +7,11 @@
 //! is locked to the video frame and re-encoding barely touches it. So an audio
 //! match corroborates a borderline visual match.
 //!
-//! The alignment is the same sliding minimum-average-Hamming idea as
-//! [`crate::align::best_alignment`], on 32-bit values, with the same optional
+//! The alignment is [`crate::align::best_alignment`]'s sliding
+//! minimum-average-Hamming search on 32-bit values, with the same optional
 //! motion gate ([`DedupParams::audio_motion_bits`]) — silence fingerprints to a
-//! constant run and would otherwise match any other silent stretch.
+//! constant run and would otherwise match any other silent stretch — and the
+//! same two overlap floors (see [`crate::align`]).
 //!
 //! Edges here are corroboration by default. The exception is
 //! [`DedupParams::audio_alone_bits`], a much tighter bar at which audio admits a
@@ -19,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use crate::align::{Alignment, orient};
+use crate::align::{Alignment, Floors, best_alignment_generic, orient};
 use crate::config::DedupParams;
 
 /// Sample rate fed to the fingerprinter, in Hz. Fixed: it defines the audio
@@ -37,11 +38,26 @@ pub fn hamming32(a: u32, b: u32) -> u32 {
     (a ^ b).count_ones()
 }
 
+/// [`hamming32`] over references, for [`crate::align::moving_mask`].
+fn hamming32_dist(a: &u32, b: &u32) -> u32 {
+    hamming32(*a, *b)
+}
+
+fn audio_floors(params: &DedupParams, len_a: usize, len_b: usize) -> Option<Floors> {
+    Floors::for_pair(
+        params.audio_min_overlap,
+        params.audio_min_overlap_hard_floor,
+        len_a,
+        len_b,
+    )
+}
+
 /// Find the best alignment of `b` against `a` by sliding `b`'s sub-fingerprint
 /// sequence and minimizing the average Hamming distance over the overlap.
 ///
 /// Only alignments with overlap at least `min_overlap` are considered. Returns
-/// [`Alignment::NO_MATCH`] when none qualifies.
+/// [`Alignment::NO_MATCH`] when none qualifies. [`align_audio`] applies the two
+/// floors of a [`DedupParams`] instead.
 ///
 /// `motion_bits` is the audio motion gate: only sub-fingerprints where either side
 /// differs from a neighbor by that much are scored or counted toward the overlap, so a
@@ -52,63 +68,7 @@ pub fn best_audio_alignment(
     min_overlap: usize,
     motion_bits: u32,
 ) -> Alignment {
-    // At least one overlapping sub-fingerprint; treat 0 as 1 so the average is
-    // never computed over an empty (0/0 -> NaN) overlap.
-    let min_overlap = min_overlap.max(1);
-    if a.is_empty() || b.is_empty() {
-        return Alignment::NO_MATCH;
-    }
-    // See `align::best_alignment`: guard the i32 shift casts against
-    // pathologically long inputs rather than truncating into bogus bounds.
-    if a.len() > i32::MAX as usize || b.len() > i32::MAX as usize || min_overlap > i32::MAX as usize
-    {
-        return Alignment::NO_MATCH;
-    }
-    let max_pos: i32 = a.len() as i32 - min_overlap as i32;
-    let max_neg: i32 = min_overlap as i32 - b.len() as i32;
-    if max_pos < max_neg {
-        return Alignment::NO_MATCH;
-    }
-    let masks = crate::align::masks_for(a, b, motion_bits, hamming32_dist);
-    let mut best = Alignment::NO_MATCH;
-    for shift in max_neg..=max_pos {
-        let (a_start, b_start) = if shift >= 0 {
-            (shift as usize, 0)
-        } else {
-            (0, (-shift) as usize)
-        };
-        let overlap = (a.len() - a_start).min(b.len() - b_start);
-        if overlap < min_overlap {
-            continue;
-        }
-        let a_win = &a[a_start..a_start + overlap];
-        let b_win = &b[b_start..b_start + overlap];
-        let win_masks = masks.as_ref().map(|(ma, mb)| {
-            (
-                &ma[a_start..a_start + overlap],
-                &mb[b_start..b_start + overlap],
-            )
-        });
-        let (moving_overlap, total_bits) =
-            crate::align::score_window(a_win, b_win, win_masks, hamming32_dist);
-        if moving_overlap < min_overlap {
-            continue;
-        }
-        let avg = (total_bits as f64 / moving_overlap as f64) as f32;
-        if avg < best.avg_bits {
-            best = Alignment {
-                shift,
-                avg_bits: avg,
-                overlap: moving_overlap,
-            };
-        }
-    }
-    best
-}
-
-/// [`hamming32`] over references, for [`crate::align::moving_mask`].
-fn hamming32_dist(a: &u32, b: &u32) -> u32 {
-    hamming32(*a, *b)
+    best_alignment_generic(a, b, Floors::flat(min_overlap), motion_bits, hamming32_dist)
 }
 
 /// The audio analogue of [`crate::align::best_matching_run`]: the best-matching stretch of
@@ -122,14 +82,8 @@ pub fn best_matching_audio_run(
     b: &[u32],
     params: &DedupParams,
 ) -> Option<crate::align::RunMatch> {
-    crate::align::best_run_generic(
-        a,
-        b,
-        params.audio_min_overlap,
-        params.audio_min_overlap_hard_floor,
-        params.audio_motion_bits,
-        hamming32_dist,
-    )
+    let floors = audio_floors(params, a.len(), b.len())?;
+    crate::align::best_run_generic(a, b, floors, params.audio_motion_bits, hamming32_dist)
 }
 
 /// How much of two sub-fingerprint sequences is really shared, walking out from a
@@ -154,26 +108,20 @@ pub fn shared_audio_span(
     )
 }
 
-/// Score a single pair of sub-fingerprint sequences. `(avg_bits, overlap)`, or
-/// `None` when either side is below the audio hard floor or no shift meets the
-/// adaptive floor. Mirrors [`crate::align::score_visual`]'s floor logic on the
-/// audio parameters.
+/// [`best_audio_alignment`] under the floors of `params`: the audio analogue of
+/// [`crate::align::align_visual`], on `audio_min_overlap`,
+/// `audio_min_overlap_hard_floor` and `audio_motion_bits`. `None` when a
+/// sequence is shorter than the hard floor or no shift clears both bars.
+pub fn align_audio(a: &[u32], b: &[u32], params: &DedupParams) -> Option<Alignment> {
+    let floors = audio_floors(params, a.len(), b.len())?;
+    let alignment = best_alignment_generic(a, b, floors, params.audio_motion_bits, hamming32_dist);
+    alignment.matched().then_some(alignment)
+}
+
+/// Score a single pair of sub-fingerprint sequences: [`align_audio`] as
+/// `(avg_bits, overlap)`, `None` when no alignment clears the floors.
 pub fn score_audio(a: &[u32], b: &[u32], params: &DedupParams) -> Option<(f32, usize)> {
-    if a.len() < params.audio_min_overlap_hard_floor
-        || b.len() < params.audio_min_overlap_hard_floor
-    {
-        return None;
-    }
-    let effective_min = params
-        .audio_min_overlap
-        .max(params.audio_min_overlap_hard_floor)
-        .min(a.len())
-        .min(b.len());
-    let alignment = best_audio_alignment(a, b, effective_min, params.audio_motion_bits);
-    if alignment.overlap < effective_min {
-        return None;
-    }
-    Some((alignment.avg_bits, alignment.overlap))
+    align_audio(a, b, params).map(|alignment| (alignment.avg_bits, alignment.overlap))
 }
 
 /// A candidate audio-corroborated duplicate edge, oriented so `canonical` is
@@ -231,19 +179,10 @@ where
             if excluded.contains(&pair) {
                 continue;
             }
-            if fa.len() < params.audio_min_overlap_hard_floor
-                || fb.len() < params.audio_min_overlap_hard_floor
-            {
+            let Some(alignment) = align_audio(fa, fb, params) else {
                 continue;
-            }
-            let effective_min = params
-                .audio_min_overlap
-                .max(params.audio_min_overlap_hard_floor)
-                .min(fa.len())
-                .min(fb.len());
-            let alignment = best_audio_alignment(fa, fb, effective_min, params.audio_motion_bits);
-            if alignment.overlap < effective_min || alignment.avg_bits > params.audio_threshold_bits
-            {
+            };
+            if alignment.avg_bits > params.audio_threshold_bits {
                 continue;
             }
             let (canonical, member) = orient(id_a, id_b, ranks);
@@ -294,6 +233,48 @@ mod tests {
     audio as far as the motion gate is concerned. */
     fn moving_fp(n: u32) -> Vec<u32> {
         (0..n).map(|i| i.wrapping_mul(0x9E37_79B9)).collect()
+    }
+
+    /* Sound then digital silence. The first silent element still moves against the last sound,
+    so the gate scores `sound + 1` of them. */
+    fn silent_tailed(sound: u32, silence: usize) -> Vec<u32> {
+        moving_fp(sound)
+            .into_iter()
+            .chain(std::iter::repeat_n(0u32, silence))
+            .collect()
+    }
+
+    fn audio_floor_params(target: usize, hard_floor: usize) -> DedupParams {
+        DedupParams {
+            audio_min_overlap: target,
+            audio_min_overlap_hard_floor: hard_floor,
+            audio_motion_bits: 2,
+            ..DedupParams::default()
+        }
+    }
+
+    #[test]
+    fn a_fingerprint_with_a_silent_tail_matches_its_copy_across_the_sound() {
+        // 40 of sound then 20 of silence: a 60-wide floor on raw length could never be scored.
+        let fp = silent_tailed(40, 20);
+        let p = audio_floor_params(60, 30);
+        assert_eq!(score_audio(&fp, &fp, &p), Some((0.0, 41)));
+    }
+
+    #[test]
+    fn a_fingerprint_that_cannot_score_the_hard_floor_is_refused() {
+        let fp = silent_tailed(20, 40);
+        assert!(score_audio(&fp, &fp, &audio_floor_params(60, 30)).is_none());
+    }
+
+    #[test]
+    fn a_zero_hard_floor_does_not_turn_no_match_into_a_score() {
+        // Silence scores nothing; a hard floor of 0 must still demand one scored element.
+        let silence = vec![0u32; 60];
+        assert_eq!(
+            score_audio(&silence, &silence, &audio_floor_params(60, 0)),
+            None
+        );
     }
 
     #[test]

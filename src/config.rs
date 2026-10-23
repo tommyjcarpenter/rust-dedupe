@@ -51,25 +51,29 @@ pub struct DedupParams {
     /// average over all overlapping frames.
     pub motion_bits: u32,
 
-    /// Target minimum number of overlapping frames a visual alignment must
-    /// cover. Adapts down per pair toward `min_overlap_hard_floor` for short
-    /// clips, but never below it.
+    /// Target number of frames a visual alignment must span. Adapts down per
+    /// pair to the shorter clip, but never below `min_overlap_hard_floor`. The
+    /// frames the motion gate scores inside that span are held to this target
+    /// only when the span holds that many; see [`crate::align_visual`].
     pub min_overlap_frames: usize,
 
     /// Hard floor below which a visual match is refused regardless of clip
-    /// length. Below this, the sliding search finds false positives reliably
-    /// enough that no threshold rescues precision.
+    /// length, on the frames an alignment spans and on the frames the motion
+    /// gate scores in them. Below this, the sliding search finds false
+    /// positives reliably enough that no threshold rescues precision.
     pub min_overlap_hard_floor: usize,
 
     /// Average per-sub-fingerprint Hamming distance at or below which an audio
     /// alignment is taken as a match. Out of 32 bits.
     pub audio_threshold_bits: f32,
 
-    /// Target minimum number of overlapping audio sub-fingerprints. Adapts
-    /// down per pair toward `audio_min_overlap_hard_floor`, never below it.
+    /// Target number of sub-fingerprints an audio alignment must span. Adapts
+    /// down per pair to the shorter sequence, never below
+    /// `audio_min_overlap_hard_floor`; the two floors work as the visual ones do.
     pub audio_min_overlap: usize,
 
-    /// Hard floor below which an audio match is refused regardless of length.
+    /// Hard floor below which an audio match is refused regardless of length,
+    /// on the span and on the sub-fingerprints the audio gate scores in it.
     pub audio_min_overlap_hard_floor: usize,
 
     /// The audio analogue of `motion_bits`. Silence fingerprints to a constant run, so

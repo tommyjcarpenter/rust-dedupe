@@ -184,7 +184,12 @@ impl Extractor {
         if !data.len().is_multiple_of(SAMPLE_BYTES) {
             return Err(ExtractError::Truncated);
         }
-        Ok(data.chunks_exact(SAMPLE_BYTES).map(dhash_9x8).collect())
+        Ok(data
+            .as_chunks::<SAMPLE_BYTES>()
+            .0
+            .iter()
+            .map(|chunk| dhash_9x8(chunk))
+            .collect())
     }
 
     /// Sample `path[start_secs .. start_secs + window_secs]` into Chromaprint

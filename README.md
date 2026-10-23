@@ -57,7 +57,7 @@ cargo run --example workflow
 ### Compare two video clips
 
 ```rust
-use perceptual_dedupe::{DedupParams, best_alignment};
+use perceptual_dedupe::{DedupParams, align_visual};
 
 // Each clip is a sequence of per-frame 64-bit hashes. Produce them yourself,
 // or with the `ffmpeg` feature (below).
@@ -65,8 +65,8 @@ let clip_a: Vec<u64> = /* frame hashes */ vec![];
 let clip_b: Vec<u64> = /* frame hashes */ vec![];
 
 let params = DedupParams::default();
-let m = best_alignment(&clip_a, &clip_b, params.min_overlap_frames, params.motion_bits);
-if m.matched() && m.avg_bits <= params.threshold_bits {
+let dupe = align_visual(&clip_a, &clip_b, &params).filter(|m| m.avg_bits <= params.threshold_bits);
+if let Some(m) = dupe {
     println!("duplicate: avg {:.1} bits over {} frames", m.avg_bits, m.overlap);
 }
 ```
@@ -164,6 +164,17 @@ every overlapping frame. `audio_motion_bits` is the same gate on the audio
 signal, off by default; silence fingerprints to a constant run, so without it
 two silent stretches align at ~0 bits and match anything.
 
+The overlap floors are two bars. `min_overlap_frames` is on the window an
+alignment spans, in raw frames: it adapts down to the shorter clip, never below
+`min_overlap_hard_floor`, and a clip shorter than the hard floor is refused.
+Inside that window the frames the motion gate scores must reach the hard floor
+too. A position scores when either clip moves there, so a frozen clip beside a
+moving copy scores every frame, a mostly static clip and its copy score their
+moving frames and match across those, and two clips that share only a frozen
+picture score nothing and never match. `align_visual`, `score_visual` and the
+run scan apply these floors; `best_alignment` holds both bars at the one number
+you pass it.
+
 `audio_alone_bits` is off by default and opts into a third verdict tier, in
 which audio admits a pair on its own. A frame hash cannot see through a
 reframe — a de-pillarboxed crop and a smaller copy of the same clip read ~20
@@ -212,8 +223,9 @@ mean. No threshold recovers it — the number measures the wrong span.
 
 `best_matching_run`, and `best_matching_audio_run` for the audio side, answer
 "do these share footage, and which part". At each offset they find the best
-window holding exactly `min_overlap` scored elements, and return it alongside
-the whole-overlap mean at that same offset. A low `run_avg_bits` beside a high
+window holding exactly `run_scored` elements, the target floor lowered to what
+that offset's window scores, and return it alongside the whole-overlap mean at
+that same offset. A low `run_avg_bits` beside a high
 `full_avg_bits` is precisely a partial overlap. Cost is the same
 `O(len_a * len_b)` sweep as the plain alignment.
 
